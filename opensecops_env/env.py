@@ -198,6 +198,8 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
         self._scaled_services: set[str] = set()
         self._rolled_back: set[str] = set()
         self._scanned: set[str] = set()
+        # Diminishing returns: tracks how many times each service was investigated
+        self._investigated: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public OpenEnv API
@@ -231,6 +233,7 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
         self._scaled_services = set()
         self._rolled_back = set()
         self._scanned = set()
+        self._investigated = {}
 
         # Build hidden state
         self._hidden = HiddenState(
@@ -370,9 +373,11 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
         if not relevant:
             relevant = [f"[{svc}] INFO  No new events."]
 
-        # Reward: useful if looking at an affected service
+        # Reward: useful if looking at an affected service (diminishing returns)
         if svc in self._hidden.affected_services:
-            reward = 0.2
+            times = self._investigated.get(svc, 0)
+            self._investigated[svc] = times + 1
+            reward = 0.2 if times == 0 else (0.05 if times == 1 else 0.0)
         else:
             reward = -0.05   # mild penalty for investigating healthy service
         return reward, f"Logs for '{svc}':\n" + "\n".join(relevant[:5]), False
@@ -392,15 +397,24 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
                 f"Metrics for {svc}: cpu={m.cpu:.1f}% mem={m.memory:.1f}% "
                 f"latency={m.latency:.1f}ms err={m.error_rate:.2f}%"
             )
-            reward = 0.2 if svc in self._hidden.affected_services else -0.05
+            # Diminishing returns for repeated inspection of same service
+            if svc in self._hidden.affected_services:
+                times = self._investigated.get(svc, 0)
+                self._investigated[svc] = times + 1
+                reward = 0.2 if times == 0 else (0.05 if times == 1 else 0.0)
+            else:
+                reward = -0.05
         else:
+            # Global inspect_metrics({}) — useful once, neutral after that
+            times = self._investigated.get("__all__", 0)
+            self._investigated["__all__"] = times + 1
             lines = [
                 f"  {s}: cpu={m.cpu:.1f}% mem={m.memory:.1f}% "
                 f"latency={m.latency:.1f}ms err={m.error_rate:.2f}%"
                 for s, m in self._metrics.items()
             ]
             msg = "All metrics:\n" + "\n".join(lines)
-            reward = 0.2
+            reward = 0.2 if times == 0 else 0.0
 
         return reward, msg, False
 
@@ -432,7 +446,11 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
                 )
             else:
                 msg = f"SECURITY SCAN – {target}: Anomalies detected."
-            reward = 0.3   # correct inference
+            # Diminishing returns: +0.3 first scan, 0.0 on repeat
+            already = f"run_security_scan:{target}" in (
+                self._state.investigation_actions[:-1]  # exclude just-appended entry
+            )
+            reward = 0.0 if already else 0.3
         else:
             msg = f"SECURITY SCAN – {target}: No critical vulnerabilities found."
             reward = -0.05
@@ -541,13 +559,22 @@ class OpenSecOpsEnv(_EnvironmentBase):  # type: ignore[misc]
         if svc not in self._metrics:
             return -0.2, f"Service '{svc}' not found.", False
 
-        self._rolled_back.add(svc)
         key = f"rollback_deployment:{svc}"
 
         if key in self._task_cfg.get("correct_mitigations", []):
-            self._state.mitigation_actions.append(key)
-            reward = 0.5
-            msg = f"Deployment of '{svc}' rolled back to {version}. System stabilising."
+            # Only grant reward first time this rollback is performed
+            if key not in self._state.mitigation_actions:
+                # Normalise metrics — bad config is gone after rollback
+                self._metrics[svc].latency    = max(80.0, self._metrics[svc].latency * 0.3)
+                self._metrics[svc].error_rate = max(0.5,  self._metrics[svc].error_rate * 0.1)
+                self._metrics[svc].cpu        = max(0.0,  self._metrics[svc].cpu - 20.0)
+                self._state.mitigation_actions.append(key)
+                self._rolled_back.add(svc)
+                reward = 0.5
+                msg = f"Deployment of '{svc}' rolled back to {version}. Latency and error rate normalising."
+            else:
+                reward = 0.0
+                msg = f"'{svc}' was already rolled back."
         else:
             reward = -0.1
             msg = f"Rolling back '{svc}' had no meaningful impact on the incident."

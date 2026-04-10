@@ -238,13 +238,81 @@ TASK_HARD = _task(
 
 
 # ---------------------------------------------------------------------------
+# TASK 4 – MEDIUM-HARD: Bad deployment rolled out to api + cache
+# ---------------------------------------------------------------------------
+TASK_MEDIUM_HARD = _task(
+    task_id="medium_hard_bad_deployment",
+    difficulty="medium_hard",
+    seed=9999,
+    true_root_cause="misconfiguration",
+    subtype="bad_config",
+    affected_services=["api", "cache"],
+    noise_level=0.35,
+    max_steps=45,
+    description=(
+        "A bad configuration was pushed in the v2.4.1 deployment of the api "
+        "service — an invalid Redis connection string caused cache to enter a "
+        "reconnect storm, amplifying API latency and error rates. The auth and "
+        "DB services are healthy. The agent must inspect metrics, correlate "
+        "deployment logs with the timing of the degradation, rollback the api "
+        "deployment to v2.4.0, flush/restart the cache, and submit: "
+        "misconfiguration:bad_config."
+    ),
+    correct_mitigations=[
+        "rollback_deployment:api",
+        "restart_service:cache",
+    ],
+    correct_label="misconfiguration:bad_config",
+    initial_metrics={
+        "api":     {"cpu": 68.0, "memory": 55.0, "latency": 720.0,  "error_rate": 14.2},
+        "cache":   {"cpu": 82.0, "memory": 71.0, "latency": 950.0,  "error_rate": 22.0},
+        "auth":    {"cpu": 21.0, "memory": 33.0, "latency": 85.0,   "error_rate": 0.4},
+        "db":      {"cpu": 19.0, "memory": 48.0, "latency": 18.0,   "error_rate": 0.2},
+        "gateway": {"cpu": 30.0, "memory": 25.0, "latency": 160.0,  "error_rate": 3.1},
+    },
+    initial_alerts=[
+        {"service": "api",   "type": "high_error_rate", "severity": "critical",
+         "message": "API error rate 14.2% — spike began ~18 min ago"},
+        {"service": "cache", "type": "high_latency",    "severity": "critical",
+         "message": "Cache p99 latency 950ms — reconnect storm suspected"},
+        {"service": "cache", "type": "high_cpu",        "severity": "warning",
+         "message": "Cache CPU 82% — elevated since last deployment"},
+        # Misleading alert
+        {"service": "gateway", "type": "high_error_rate", "severity": "warning",
+         "message": "Gateway 5xx rate 3.1% — downstream propagation from api"},
+    ],
+    initial_logs=[
+        "[deploy] INFO  api v2.4.1 rolled out at 03:42 UTC (18 min ago)",
+        "[api]    ERROR redis.exceptions.ConnectionError: max retries exceeded",
+        "[api]    WARN  Cache fallback disabled — all requests hitting DB",
+        "[cache]  ERROR MISCONF: invalid config REDIS_URL='' — reconnect loop",
+        "[cache]  WARN  Connection pool exhausted: 512/512 slots in use",
+        "[api]    ERROR POST /api/v1/checkout timeout after 720ms",
+        # Noise
+        "[auth]   INFO  Token validation OK — 1,200 req/min",
+        "[db]     INFO  Query plan cache warm — no slow queries",
+        "[deploy] INFO  auth v1.9.3 unchanged",
+    ],
+    topology={
+        "gateway": ["api"],
+        "api":     ["cache", "auth", "db"],
+        "auth":    ["db"],
+        "cache":   [],
+        "db":      [],
+    },
+    attack_progress_start=0.0,
+)
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 TASKS: dict[str, TaskConfig] = {
-    "easy_memory_leak":       TASK_EASY,
-    "medium_ddos_cascade":    TASK_MEDIUM,
-    "hard_data_exfiltration": TASK_HARD,
+    "easy_memory_leak":          TASK_EASY,
+    "medium_ddos_cascade":       TASK_MEDIUM,
+    "medium_hard_bad_deployment": TASK_MEDIUM_HARD,
+    "hard_data_exfiltration":    TASK_HARD,
 }
 
 
@@ -252,3 +320,4 @@ def get_task(task_id: str) -> TaskConfig:
     if task_id not in TASKS:
         raise ValueError(f"Unknown task '{task_id}'. Available: {list(TASKS)}")
     return TASKS[task_id]
+

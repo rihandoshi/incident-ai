@@ -128,6 +128,21 @@ tasks:
       - "block_ip:198.51.100.12"
       - "scale_service:api"
 
+  - id: medium_hard_bad_deployment
+    difficulty: medium_hard
+    seed: 9999
+    max_steps: 45
+    description: >
+      A bad api v2.4.1 deployment introduced an invalid Redis connection string,
+      causing the cache service to enter a reconnect storm and amplifying API
+      latency and error rates. The agent must correlate deployment logs with the
+      onset of degradation, rollback the api deployment, restart cache, and
+      submit: misconfiguration:bad_config.
+    correct_label: "misconfiguration:bad_config"
+    correct_mitigations:
+      - "rollback_deployment:api"
+      - "restart_service:cache"
+
   - id: hard_data_exfiltration
     difficulty: hard
     seed: 31337
@@ -138,12 +153,15 @@ tasks:
       unrelated services.  Agent must run security scans, correlate
       audit logs, isolate the DB, block the exfiltration destination IP,
       and submit: cyber_attack:data_exfiltration.
+      NOTE: run_security_scan actions are listed here as correct_mitigations
+      and are graded from the investigation_actions list (both lists are checked).
     correct_label: "cyber_attack:data_exfiltration"
     correct_mitigations:
       - "run_security_scan:db"
       - "run_security_scan:auth"
       - "isolate_service:db"
       - "block_ip:10.0.0.99"
+
 
 # ---------------------------------------------------------------------------
 # Reward signal

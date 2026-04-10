@@ -1,3 +1,18 @@
+---
+title: OpenSecOpsEnv
+emoji: 🔐
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8000
+tags:
+  - openenv
+  - reinforcement-learning
+  - secops
+  - incident-response
+  - agent-evaluation
+---
+
 # 🔐 OpenSecOpsEnv
 
 > **An OpenEnv-compliant incident response environment where an AI agent acts as an on-call security engineer.**
@@ -108,17 +123,23 @@ cyber_attack:privilege_escalation
 ### Task 1 – EASY: `easy_memory_leak` (seed=42)
 **Scenario:** The `auth` service has a progressive memory leak.  
 **Signals:** Clear log messages, steadily rising memory metrics, single service affected.  
-**Correct actions:** Query auth logs → Inspect auth metrics → Restart auth → Submit `infra_failure:memory_leak`  
+**Correct actions:** Inspect metrics → Query auth logs → Restart auth → Submit `infra_failure:memory_leak`  
 **Max steps:** 30 | **Noise:** 5%
 
 ### Task 2 – MEDIUM: `medium_ddos_cascade` (seed=1337)
 **Scenario:** DDoS attack from two IP ranges cascades through gateway → api → auth.  
-**Signals:** Multiple services degraded, requires IP correlation from gateway logs.  
+**Signals:** Multiple services degraded, requires IP correlation from logs across api and auth.  
 **Correct actions:** Block both IPs (203.0.113.45, 198.51.100.12) → Scale api → Submit `cyber_attack:ddos`  
 **Max steps:** 40 | **Noise:** 25%
 
-### Task 3 – HARD: `hard_data_exfiltration` (seed=31337)
-**Scenario:** Compromised service account (`reports_bot`) exfiltrating 4+ GB of data from the DB to an external host. False alerts injected on cache service to mislead.  
+### Task 3 – MEDIUM-HARD: `medium_hard_bad_deployment` (seed=9999)
+**Scenario:** A bad `api` v2.4.1 deployment pushed an invalid Redis connection string, sending the cache service into a reconnect storm. False gateway alerts distract from the real cause.  
+**Signals:** Deployment timestamp in logs correlates with degradation onset. Cache error logs show `MISCONF: invalid config REDIS_URL=''`.  
+**Correct actions:** Inspect metrics → Query api/cache logs → Rollback api deployment → Restart cache → Submit `misconfiguration:bad_config`  
+**Max steps:** 45 | **Noise:** 35%
+
+### Task 4 – HARD: `hard_data_exfiltration` (seed=31337)
+**Scenario:** Compromised service account (`reports_bot`) exfiltrating 4+ GB of data from the DB to an external host. False alerts on cache service to mislead.  
 **Signals:** Buried in noisy logs, 55% noise, false critical alert on cache.  
 **Correct actions:** Run security scans on db+auth → Isolate db → Block 10.0.0.99 → Submit `cyber_attack:data_exfiltration`  
 **Max steps:** 50 | **Noise:** 55%
@@ -127,7 +148,7 @@ cyber_attack:privilege_escalation
 
 ## 🏆 Reward Function
 
-Dense rewards are provided at every step:
+Dense rewards are provided at every step (with **diminishing returns** for repeated investigation):
 
 | Event | Reward |
 |-------|--------|
@@ -158,13 +179,18 @@ score = 0.5 × diagnosis_correct
 | `action_efficiency` | 30% | Fraction of correct mitigations achieved, adjusted for steps used |
 | `investigation_quality` | 20% | Fraction of affected services investigated |
 
-### Baseline Scores (heuristic agent)
+### Baseline Scores
 
-| Task | Score |
-|------|-------|
-| easy_memory_leak | ~0.95 |
-| medium_ddos_cascade | ~0.90 |
-| hard_data_exfiltration | ~0.88 |
+| Task | Difficulty | Heuristic agent | Qwen/Qwen2.5-72B LLM |
+|------|-----------|-----------------|----------------------|
+| easy_memory_leak | Easy | ~0.95 | **1.00** |
+| medium_ddos_cascade | Medium | ~0.90 | **0.73** |
+| medium_hard_bad_deployment | Medium-Hard | ~0.93 | **~0.75** |
+| hard_data_exfiltration | Hard | ~0.93 | **0.80** |
+| **Average** | | **~0.93** | **~0.82** |
+
+> Scores in **[0, 1]**. A frontier 72B model scores ~0.82, showing the benchmark is
+> hard enough to discriminate, but not unsolvable.
 
 ---
 

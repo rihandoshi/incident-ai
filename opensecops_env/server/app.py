@@ -1,15 +1,23 @@
 """
 FastAPI Server for OpenSecOpsEnv
 =================================
-Exposes reset(), step(), state() over HTTP/WebSocket.
+Exposes reset(), step(), state() over HTTP.
 
 Endpoints
 ---------
-POST /reset          – begin new episode
-POST /step           – execute one action
-GET  /state          – get full debug state
-GET  /health         – health probe
+POST /reset          – begin new episode (creates/replaces session)
+POST /step           – execute one action within a session
+GET  /state          – get full debug state for a session
+POST /grade          – grade the current episode
+GET  /health         – liveness probe
+GET  /tasks          – list available tasks
 GET  /web            – interactive web UI (if ENABLE_WEB_INTERFACE=true)
+
+Session model
+-------------
+Each reset() call creates a named session keyed by `session_id`
+(defaults to the task_id). This allows multiple concurrent agents
+to run different tasks without colliding.
 """
 
 from __future__ import annotations
@@ -24,11 +32,22 @@ from pydantic import BaseModel
 from opensecops_env.env import OpenSecOpsEnv
 from opensecops_env.models import SecOpsAction
 from opensecops_env.grader import grade
+from opensecops_env.tasks.task_definitions import TASKS
 
 # ---------------------------------------------------------------------------
-# Singleton environment instance
+# Session registry  (session_id → OpenSecOpsEnv instance)
 # ---------------------------------------------------------------------------
-env = OpenSecOpsEnv()
+_sessions: dict[str, OpenSecOpsEnv] = {}
+_default_session: str = "default"
+
+
+def _get_session(session_id: str) -> OpenSecOpsEnv:
+    if session_id not in _sessions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session '{session_id}' not found. Call /reset first.",
+        )
+    return _sessions[session_id]
 
 
 # ---------------------------------------------------------------------------
@@ -37,11 +56,13 @@ env = OpenSecOpsEnv()
 
 class ResetRequest(BaseModel):
     task_id: str = "easy_memory_leak"
+    session_id: str = ""          # defaults to task_id when empty
 
 
 class StepRequest(BaseModel):
     action_type: str
     parameters: dict[str, Any] = {}
+    session_id: str = "default"
 
 
 class StepResponse(BaseModel):
@@ -70,27 +91,51 @@ app = FastAPI(
     title="OpenSecOpsEnv",
     description=(
         "SecOps incident response environment for RL agent evaluation. "
-        "Simulates memory leaks, DDoS attacks, and data exfiltration scenarios."
+        "Simulates memory leaks, DDoS attacks, misconfiguration, and "
+        "data exfiltration scenarios across 4 tasks of increasing difficulty."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe."""
-    return {"status": "ok", "environment": "opensecops"}
+    return {"status": "ok", "environment": "opensecops", "version": "0.2.0"}
+
+
+@app.get("/tasks")
+def list_tasks() -> dict[str, Any]:
+    """List all available tasks with metadata."""
+    return {
+        "tasks": [
+            {
+                "id": tid,
+                "difficulty": cfg["difficulty"],
+                "max_steps": cfg["max_steps"],
+                "description": cfg["description"][:120] + "...",
+            }
+            for tid, cfg in TASKS.items()
+        ]
+    }
 
 
 @app.post("/reset")
 def reset(req: ResetRequest) -> dict[str, Any]:
     """Start a new episode. Returns the initial observation."""
+    session_id = req.session_id or req.task_id
     try:
+        env = OpenSecOpsEnv()
         obs = env.reset(task_id=req.task_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    _sessions[session_id] = env
+    global _default_session
+    _default_session = session_id
+
     return {
+        "session_id": session_id,
         "observation": {
             "alerts": obs.alerts,
             "metrics": obs.metrics,
@@ -99,13 +144,16 @@ def reset(req: ResetRequest) -> dict[str, Any]:
             "last_action_result": obs.last_action_result,
             "time_step": obs.time_step,
             "available_actions": obs.available_actions,
-        }
+        },
     }
 
 
 @app.post("/step", response_model=StepResponse)
 def step(req: StepRequest) -> StepResponse:
     """Execute one action and receive the next observation + reward."""
+    sid = req.session_id if req.session_id != "default" else _default_session
+    env = _get_session(sid)
+
     action = SecOpsAction(
         action_type=req.action_type,
         parameters=req.parameters,
@@ -129,14 +177,18 @@ def step(req: StepRequest) -> StepResponse:
 
 
 @app.get("/state", response_model=StateResponse)
-def state() -> StateResponse:
+def state(session_id: str = "") -> StateResponse:
     """Return the full internal state (for debugging / graders)."""
+    sid = session_id or _default_session
+    env = _get_session(sid)
     return StateResponse(state=env.state.to_dict())
 
 
 @app.post("/grade", response_model=GradeResponse)
-def grade_episode() -> GradeResponse:
+def grade_episode(session_id: str = "") -> GradeResponse:
     """Grade the current (or most recently completed) episode."""
+    sid = session_id or _default_session
+    env = _get_session(sid)
     result = grade(env.state.to_dict())
     return GradeResponse(
         score=result.score,
@@ -145,6 +197,7 @@ def grade_episode() -> GradeResponse:
         investigation_quality=result.investigation_quality,
         details=result.details,
     )
+
 
 
 # ---------------------------------------------------------------------------

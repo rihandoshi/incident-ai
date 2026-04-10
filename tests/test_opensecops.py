@@ -28,9 +28,11 @@ def env():
 
 class TestTaskDefinitions:
     def test_all_tasks_present(self):
-        assert "easy_memory_leak"       in TASKS
-        assert "medium_ddos_cascade"    in TASKS
-        assert "hard_data_exfiltration" in TASKS
+        assert "easy_memory_leak"            in TASKS
+        assert "medium_ddos_cascade"         in TASKS
+        assert "medium_hard_bad_deployment"  in TASKS
+        assert "hard_data_exfiltration"      in TASKS
+        assert len(TASKS) >= 4, "Expected at least 4 tasks"
 
     def test_task_has_required_fields(self):
         required = [
@@ -219,20 +221,31 @@ class TestGrader:
         env.reset(task_id)
         seqs = {
             "easy_memory_leak": [
+                SecOpsAction("inspect_metrics", {}),
                 SecOpsAction("query_logs", {"service": "auth"}),
-                SecOpsAction("inspect_metrics", {"service": "auth"}),
                 SecOpsAction("restart_service", {"service": "auth"}),
                 SecOpsAction("submit_diagnosis",
                              {"label": "infra_failure:memory_leak"}),
             ],
             "medium_ddos_cascade": [
                 SecOpsAction("inspect_metrics", {}),
-                SecOpsAction("query_logs", {"service": "gateway"}),
+                SecOpsAction("query_logs", {"service": "api"}),
+                SecOpsAction("query_logs", {"service": "auth"}),
                 SecOpsAction("run_security_scan", {"target": "api"}),
                 SecOpsAction("block_ip", {"ip": "203.0.113.45"}),
                 SecOpsAction("block_ip", {"ip": "198.51.100.12"}),
                 SecOpsAction("scale_service", {"service": "api", "replicas": 5}),
                 SecOpsAction("submit_diagnosis", {"label": "cyber_attack:ddos"}),
+            ],
+            "medium_hard_bad_deployment": [
+                SecOpsAction("inspect_metrics", {}),
+                SecOpsAction("query_logs", {"service": "api"}),
+                SecOpsAction("query_logs", {"service": "cache"}),
+                SecOpsAction("rollback_deployment",
+                             {"service": "api", "version": "previous"}),
+                SecOpsAction("restart_service", {"service": "cache"}),
+                SecOpsAction("submit_diagnosis",
+                             {"label": "misconfiguration:bad_config"}),
             ],
             "hard_data_exfiltration": [
                 SecOpsAction("inspect_metrics", {}),
@@ -271,7 +284,14 @@ class TestGrader:
     def test_grade_hard_correct_reasonable_score(self, env):
         state = self._run_optimal("hard_data_exfiltration", env)
         result = grade(state)
-        assert result.score >= 0.6
+        assert result.score >= 0.8   # optimal play now scores 1.0 after grader fix
+        assert result.diagnosis_correct == 1.0
+
+    def test_grade_medium_hard_correct_decent_score(self, env):
+        state = self._run_optimal("medium_hard_bad_deployment", env)
+        result = grade(state)
+        assert result.score >= 0.8
+        assert result.diagnosis_correct == 1.0
 
     def test_grade_wrong_diagnosis_low_score(self, env):
         env.reset("easy_memory_leak")

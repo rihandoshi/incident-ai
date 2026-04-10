@@ -106,10 +106,10 @@ SYSTEM_PROMPT = textwrap.dedent("""
     You are investigating a production incident in a distributed system.
 
     At each step you receive:
-      alerts   – threshold-based monitoring alerts
+      alerts   – threshold-based monitoring alerts (may include false alarms)
       metrics  – per-service CPU / memory / latency / error_rate
       logs     – recent (potentially noisy) log lines
-      topology – service dependency graph
+      topology – service dependency graph (service → downstream deps)
       last_action_result – outcome of your previous action
 
     You must take actions to diagnose the root cause and apply mitigations.
@@ -127,7 +127,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
       restart_service     {\"service\": \"<name>\"}
       scale_service       {\"service\": \"<name>\", \"replicas\": <int>}
       block_ip            {\"ip\": \"<address>\"}
-      rollback_deployment {\"service\": \"<name>\", \"version\": \"<tag>\"}
+      rollback_deployment {\"service\": \"<name>\", \"version\": \"previous\"}
       run_security_scan   {\"target\": \"<name>\"}
       isolate_service     {\"service\": \"<name>\"}
       submit_diagnosis    {\"label\": \"<root_cause>:<subtype>\"}
@@ -140,12 +140,27 @@ SYSTEM_PROMPT = textwrap.dedent("""
       cyber_attack:data_exfiltration
       cyber_attack:privilege_escalation
 
-    Strategy:
-      1. Inspect metrics broadly first.
-      2. Query logs or run security scans on suspicious services.
-      3. Apply targeted mitigations.
-      4. Submit your diagnosis when confident.
-      Avoid wasted actions — penalising wrong mitigations or blocking legit IPs.
+    Investigation strategy (follow this order):
+      1. ALWAYS start with inspect_metrics({}) to see ALL services at once.
+      2. Check the topology — gateway/proxy services propagate problems from
+         BACKEND services (api, auth, db, cache). Focus your investigation on
+         the backend, not the gateway.
+      3. Query logs for the 2-3 services with the worst metrics or most
+         suspicious alerts. Investigate EVERY service in the affected topology,
+         not just one.
+      4. If logs mention IPs, security events, or unusual outbound traffic,
+         run run_security_scan on those services BEFORE mitigating.
+      5. If logs mention a recent deployment, check rollback_deployment.
+      6. Apply TARGETED mitigations (correct service / correct IP).
+      7. Submit your diagnosis when confident.
+
+    Critical rules:
+      - Never block an IP unless you saw it in logs as a threat source.
+      - Never isolate a service unless security scans confirm compromise.
+      - Wrong mitigations (wrong IP, wrong service) carry heavy penalties.
+      - Do not repeat the same investigation action more than twice.
+      - The service with the highest latency/error_rate may just be a VICTIM
+        of a problem upstream — always trace back through the topology.
 """).strip()
 
 
@@ -214,12 +229,21 @@ _HEURISTIC: dict[str, list[dict]] = {
     ],
     "medium_ddos_cascade": [
         {"action_type": "inspect_metrics",    "parameters": {}},
-        {"action_type": "query_logs",         "parameters": {"service": "gateway"}},
+        {"action_type": "query_logs",         "parameters": {"service": "api"}},
+        {"action_type": "query_logs",         "parameters": {"service": "auth"}},
         {"action_type": "run_security_scan",  "parameters": {"target": "api"}},
         {"action_type": "block_ip",           "parameters": {"ip": "203.0.113.45"}},
         {"action_type": "block_ip",           "parameters": {"ip": "198.51.100.12"}},
         {"action_type": "scale_service",      "parameters": {"service": "api", "replicas": 5}},
         {"action_type": "submit_diagnosis",   "parameters": {"label": "cyber_attack:ddos"}},
+    ],
+    "medium_hard_bad_deployment": [
+        {"action_type": "inspect_metrics",      "parameters": {}},
+        {"action_type": "query_logs",           "parameters": {"service": "api"}},
+        {"action_type": "query_logs",           "parameters": {"service": "cache"}},
+        {"action_type": "rollback_deployment",  "parameters": {"service": "api", "version": "previous"}},
+        {"action_type": "restart_service",      "parameters": {"service": "cache"}},
+        {"action_type": "submit_diagnosis",     "parameters": {"label": "misconfiguration:bad_config"}},
     ],
     "hard_data_exfiltration": [
         {"action_type": "inspect_metrics",    "parameters": {}},
