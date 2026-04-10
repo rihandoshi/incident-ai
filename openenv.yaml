@@ -1,0 +1,181 @@
+spec_version: 1
+name: opensecops
+version: "0.1.0"
+description: >
+  OpenSecOpsEnv – A multi-step SecOps incident response environment
+  where an AI agent acts as an on-call engineer.  The agent must
+  investigate infrastructure failures, misconfigurations, and cyber
+  attacks (DDoS, data exfiltration) by querying logs, inspecting
+  metrics, and taking mitigation actions before submitting a final
+  diagnosis.  Observations are deliberately partial and noisy.
+
+type: container
+runtime: docker
+app: opensecops_env.server.app:app
+port: 8000
+
+# ---------------------------------------------------------------------------
+# Observation schema
+# ---------------------------------------------------------------------------
+observation:
+  type: object
+  description: Partial, noisy snapshot of the system state at each step
+  properties:
+    alerts:
+      type: array
+      description: List of triggered monitoring alerts
+      items:
+        type: object
+        properties:
+          service:  { type: string }
+          type:     { type: string }
+          severity: { type: string, enum: [info, warning, critical] }
+          message:  { type: string }
+    metrics:
+      type: object
+      description: Per-service metric snapshots (cpu/memory/latency/error_rate)
+      additionalProperties:
+        type: object
+        properties:
+          cpu:        { type: number, description: "CPU % [0-100]" }
+          memory:     { type: number, description: "Memory % [0-100]" }
+          latency:    { type: number, description: "p99 latency in ms" }
+          error_rate: { type: number, description: "Error rate %" }
+    logs:
+      type: array
+      items: { type: string }
+      description: Recent partial log lines (may contain misleading entries)
+    topology:
+      type: object
+      description: Service dependency graph {service → [downstream_deps]}
+      additionalProperties:
+        type: array
+        items: { type: string }
+    last_action_result:
+      type: string
+      description: Human-readable result of the previous action
+    time_step:
+      type: integer
+      description: Current step index within the episode
+    available_actions:
+      type: array
+      items: { type: string }
+      description: List of valid action_type values
+
+# ---------------------------------------------------------------------------
+# Action schema
+# ---------------------------------------------------------------------------
+action:
+  type: object
+  description: Structured action for the on-call agent to take
+  required: [action_type]
+  properties:
+    action_type:
+      type: string
+      enum:
+        - query_logs
+        - inspect_metrics
+        - restart_service
+        - scale_service
+        - block_ip
+        - rollback_deployment
+        - run_security_scan
+        - isolate_service
+        - submit_diagnosis
+      description: The type of action to perform
+    parameters:
+      type: object
+      description: >
+        Action-specific parameters.
+        query_logs:         {"service": "<name>"}
+        inspect_metrics:    {"service": "<name>"} or {}
+        restart_service:    {"service": "<name>"}
+        scale_service:      {"service": "<name>", "replicas": <int>}
+        block_ip:           {"ip": "<ip_address>"}
+        rollback_deployment:{"service": "<name>", "version": "<tag>"}
+        run_security_scan:  {"target": "<name>"}
+        isolate_service:    {"service": "<name>"}
+        submit_diagnosis:   {"label": "<root_cause>:<subtype>"}
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+  - id: easy_memory_leak
+    difficulty: easy
+    seed: 42
+    max_steps: 30
+    description: >
+      Single auth service memory leak. Clear logs, minimal noise.
+      Agent must query logs, inspect metrics, restart auth, and submit
+      the correct diagnosis: infra_failure:memory_leak.
+    correct_label: "infra_failure:memory_leak"
+    correct_mitigations:
+      - "restart_service:auth"
+
+  - id: medium_ddos_cascade
+    difficulty: medium
+    seed: 1337
+    max_steps: 40
+    description: >
+      DDoS attack cascading from gateway through api and auth services.
+      Ambiguous signals require correlation across multiple services.
+      Agent must identify attacking IPs from logs, block them, and scale
+      the API service. Correct label: cyber_attack:ddos.
+    correct_label: "cyber_attack:ddos"
+    correct_mitigations:
+      - "block_ip:203.0.113.45"
+      - "block_ip:198.51.100.12"
+      - "scale_service:api"
+
+  - id: hard_data_exfiltration
+    difficulty: hard
+    seed: 31337
+    max_steps: 50
+    description: >
+      Data exfiltration by a compromised service account disguised as
+      infrastructure failure.  50% noise level with false alerts on
+      unrelated services.  Agent must run security scans, correlate
+      audit logs, isolate the DB, block the exfiltration destination IP,
+      and submit: cyber_attack:data_exfiltration.
+    correct_label: "cyber_attack:data_exfiltration"
+    correct_mitigations:
+      - "run_security_scan:db"
+      - "run_security_scan:auth"
+      - "isolate_service:db"
+      - "block_ip:10.0.0.99"
+
+# ---------------------------------------------------------------------------
+# Reward signal
+# ---------------------------------------------------------------------------
+reward:
+  type: continuous
+  range: [-1.0, 1.0]
+  description: >
+    Dense reward provided at every step.
+    +0.2  useful investigation action (query_logs/inspect_metrics on affected svc)
+    +0.3  correct intermediate inference (run_security_scan revealing attack)
+    +0.5  correct mitigation step (block_ip, restart_service, isolate_service, etc.)
+    +1.0  correct final diagnosis (submit_diagnosis with correct label)
+    -0.05 irrelevant investigation action
+    -0.1  ineffective mitigation
+    -0.2  unknown action or incorrect service target
+    -0.5  harmful action (blocking legit IP, unnecessary isolation)
+    -1.0  wrong final diagnosis
+
+# ---------------------------------------------------------------------------
+# Grader
+# ---------------------------------------------------------------------------
+grader:
+  score_range: [0.0, 1.0]
+  formula: "0.5 * diagnosis_correct + 0.3 * action_efficiency + 0.2 * investigation_quality"
+  components:
+    diagnosis_correct:
+      weight: 0.5
+      description: 1.0 if label matches exactly, 0.5 if root-cause category correct, 0.0 otherwise
+    action_efficiency:
+      weight: 0.3
+      description: Fraction of correct mitigations taken, adjusted by steps used vs ideal
+    investigation_quality:
+      weight: 0.2
+      description: Fraction of affected services investigated via logs/metrics/scans
