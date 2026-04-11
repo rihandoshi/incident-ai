@@ -2,42 +2,45 @@
 OpenSecOpsEnv — Baseline Inference Script
 ==========================================
 MANDATORY
-* Before running, ensure the following variables are defined:
+- Before submitting, ensure the following variables are defined in your environment configuration:
     API_BASE_URL   The API endpoint for the LLM.
-                   Default: https://router.huggingface.co/v1
     MODEL_NAME     The model identifier to use for inference.
-                   Default: Qwen/Qwen2.5-72B-Instruct
-    HF_TOKEN       Your Hugging Face API key (used as API key).
+    HF_TOKEN       Your Hugging Face / API key.
+    LOCAL_IMAGE_NAME The name of the local image to use for the environment if you are using from_docker_image()
+                     method
 
-* Participants must use OpenAI Client for all LLM calls.
+- Defaults are set only for API_BASE_URL and MODEL_NAME
+    (and should reflect your active inference setup):
+    API_BASE_URL = os.getenv("API_BASE_URL", "<your-active-endpoint>")
+    MODEL_NAME = os.getenv("MODEL_NAME", "<your-active-model>")
+
+- The inference script must be named `inference.py` and placed in the root directory of the project
+- Participants must use OpenAI Client for all LLM calls using above variables
 
 STDOUT FORMAT
-    [START] task=<task_name> env=opensecops model=<model_name>
+- The script must emit exactly three line types to stdout, in this order:
+
+    [START] task=<task_name> env=<benchmark> model=<model_name>
     [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
     [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 
   Rules:
     - One [START] line at episode begin.
     - One [STEP] line per step, immediately after env.step() returns.
-    - One [END] line after episode ends, always emitted (even on exception).
+    - One [END] line after env.close(), always emitted (even on exception).
     - reward and rewards are formatted to 2 decimal places.
     - done and success are lowercase booleans: true or false.
-    - error is the raw last_action_result string on failure, or null.
+    - error is the raw last_action_error string, or null if none.
     - All fields on a single line with no newlines within a line.
-    - Each task returns score in [0, 1].
+    - Each tasks should return score in [0, 1]
 
-Quick start
------------
-    # Set your HF token:
-    $env:HF_TOKEN = "hf_..."
-
-    # Run all three tasks:
-    python inference.py
-
-    # Use a different model / endpoint:
-    $env:MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-    $env:API_BASE_URL = "https://router.huggingface.co/v1"
-    python inference.py
+  Example:
+    [START] task=easy_memory_leak env=opensecops model=Qwen/Qwen2.5-72B-Instruct
+    [STEP] step=1 action=inspect_metrics({}) reward=0.20 done=false error=null
+    [STEP] step=2 action=query_logs({"service": "auth"}) reward=0.20 done=false error=null
+    [STEP] step=3 action=restart_service({"service": "auth"}) reward=0.50 done=false error=null
+    [STEP] step=4 action=submit_diagnosis({"label": "infra_failure:memory_leak"}) reward=1.00 done=true error=null
+    [END] success=true steps=4 score=1.000 rewards=0.20,0.20,0.50,1.00
 """
 
 from __future__ import annotations
@@ -48,20 +51,24 @@ import sys
 import textwrap
 from typing import Any, List, Optional
 
+from openai import OpenAI
+
 # ---------------------------------------------------------------------------
-# Configuration — all from env vars with sensible defaults
+# Configuration — all from env vars per OpenEnv spec
 # ---------------------------------------------------------------------------
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN",     "")
-# Fallback key names
-_API_KEY     = HF_TOKEN or os.getenv("OPENAI_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
+# Defaults are set only for API_BASE_URL and MODEL_NAME (not HF_TOKEN)
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME   = os.getenv("MODEL_NAME")   or "Qwen/Qwen2.5-72B-Instruct"
+HF_TOKEN     = os.getenv("HF_TOKEN")
+
+# Optional — if you use from_docker_image():
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 BENCHMARK    = "opensecops"
 MAX_STEPS    = 20          # per task; keeps total runtime well under 20 min
 TEMPERATURE  = 0.2
 MAX_TOKENS   = 300
-SUCCESS_SCORE_THRESHOLD = 0.5   # score ≥ 0.5 → success
+SUCCESS_SCORE_THRESHOLD = 0.5   # score >= 0.5 → success
 
 # ---------------------------------------------------------------------------
 # Import environment
@@ -81,7 +88,7 @@ def log_start(task: str, env: str, model: str) -> None:
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_val = error if error else "null"
-    done_val  = str(done).lower()
+    done_val = str(done).lower()
     print(
         f"[STEP] step={step} action={action} reward={reward:.2f} "
         f"done={done_val} error={error_val}",
@@ -91,11 +98,7 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} "
-        f"score={score:.2f} rewards={rewards_str}",
-        flush=True,
-    )
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +274,7 @@ def _heuristic_action(task_id: str, step: int) -> str:
 # Single-task runner
 # ---------------------------------------------------------------------------
 
-def run_task(client, task_id: str) -> dict[str, Any]:
+def run_task(client: OpenAI | None, task_id: str) -> dict[str, Any]:
     """
     Run one complete episode for the given task_id.
     Returns a dict with task_id, score, success, steps, rewards.
@@ -387,23 +390,14 @@ def run_task(client, task_id: str) -> dict[str, Any]:
 
 def main() -> None:
     # ── Build OpenAI client ────────────────────────────────────────────────
-    try:
-        from openai import OpenAI as _OpenAI
-        _openai_available = True
-    except ImportError:
-        _openai_available = False
-
-    if _openai_available and _API_KEY:
-        client = _OpenAI(api_key=_API_KEY, base_url=API_BASE_URL)
+    if HF_TOKEN:
+        client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
         print(f"[INFO] LLM model   : {MODEL_NAME}", flush=True)
         print(f"[INFO] Endpoint    : {API_BASE_URL}", flush=True)
     else:
         client = None
-        if not _openai_available:
-            print("[WARN] openai package not installed — running deterministic heuristic baseline.", flush=True)
-        else:
-            print("[WARN] No HF_TOKEN set — running deterministic heuristic baseline.", flush=True)
-            print("[WARN] Set HF_TOKEN to use a real LLM: $env:HF_TOKEN = 'hf_...'", flush=True)
+        print("[WARN] No HF_TOKEN set — running deterministic heuristic baseline.", flush=True)
+        print("[WARN] Set HF_TOKEN to use a real LLM: $env:HF_TOKEN = 'hf_...'", flush=True)
 
     # ── Run all tasks ──────────────────────────────────────────────────────
     results: list[dict] = []
