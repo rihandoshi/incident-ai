@@ -31,37 +31,24 @@ class ActionType(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# OpenEnv Base Stubs (so env runs standalone without openenv-core installed)
+# Base classes — pure dataclasses (OpenEnv spec compliance is via the API
+# contract, not via Python inheritance.)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _BaseAction:
+class _ActionBase:
     pass
 
 
 @dataclass
-class _BaseObservation:
+class _ObsBase:
     pass
 
 
 @dataclass
-class _BaseState:
+class _StateBase:
     episode_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     step_count: int = 0
-
-
-try:
-    from openenv.core.env_server import Action as _OEAction
-    from openenv.core.env_server import Observation as _OEObservation
-    from openenv.core.env_server import State as _OEState
-
-    _ActionBase = _OEAction
-    _ObsBase = _OEObservation
-    _StateBase = _OEState
-except ImportError:
-    _ActionBase = _BaseAction  # type: ignore[assignment]
-    _ObsBase = _BaseObservation  # type: ignore[assignment]
-    _StateBase = _BaseState  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
