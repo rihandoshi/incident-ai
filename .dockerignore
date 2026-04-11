@@ -9,6 +9,7 @@ venv/
 .git
 .gitignore
 *.md
+!README.md
 tests/
 .pytest_cache
 dist/
