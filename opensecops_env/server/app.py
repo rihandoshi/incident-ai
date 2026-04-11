@@ -244,6 +244,7 @@ def _build_web_ui() -> str:
   <select id="task_id">
     <option value="easy_memory_leak">easy_memory_leak</option>
     <option value="medium_ddos_cascade">medium_ddos_cascade</option>
+    <option value="medium_hard_bad_deployment">medium_hard_bad_deployment</option>
     <option value="hard_data_exfiltration">hard_data_exfiltration</option>
   </select>
   <button onclick="doReset()">Reset Episode</button>

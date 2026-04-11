@@ -1,6 +1,6 @@
 spec_version: 1
 name: opensecops
-version: "0.1.0"
+version: "0.2.0"
 description: >
   OpenSecOpsEnv – A multi-step SecOps incident response environment
   where an AI agent acts as an on-call engineer.  The agent must

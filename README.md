@@ -48,25 +48,29 @@ This directly addresses the *SecOps skills gap*: can LLMs / RL agents serve as e
 ## 📦 Project Structure
 
 ```
-opensecops_env/
-├── __init__.py          # Package exports
-├── models.py            # SecOpsAction, SecOpsObservation, SecOpsState (dataclasses)
-├── env.py               # OpenSecOpsEnv – core environment (reset/step/state)
-├── grader.py            # Deterministic multi-component grader → [0, 1]
-├── client.py            # HTTP client for running server
-├── inference.py         # Baseline inference script (LLM or heuristic agent)
-├── tasks/
+├── inference.py                 # Baseline inference script (root, as required)
+├── openenv.yaml                 # OpenEnv manifest
+├── Dockerfile                   # Production container
+├── requirements.txt
+├── pyproject.toml
+├── uv.lock
+├── server/
 │   ├── __init__.py
-│   └── task_definitions.py   # EASY / MEDIUM / HARD task configs (deterministic)
-└── server/
-    ├── __init__.py
-    └── app.py           # FastAPI server (reset/step/state/grade endpoints)
-openenv.yaml             # OpenEnv manifest
-Dockerfile               # Production container
-requirements.txt
-pyproject.toml
-tests/
-└── test_opensecops.py   # pytest test suite
+│   └── app.py                   # Root-level entry point (for openenv validate)
+├── opensecops_env/
+│   ├── __init__.py              # Package exports
+│   ├── models.py                # SecOpsAction, SecOpsObservation, SecOpsState (dataclasses)
+│   ├── env.py                   # OpenSecOpsEnv – core environment (reset/step/state)
+│   ├── grader.py                # Deterministic multi-component grader → [0, 1]
+│   ├── client.py                # HTTP client for remote server interaction
+│   └── tasks/
+│       ├── __init__.py
+│       └── task_definitions.py  # 4 task configs (easy → medium → medium-hard → hard)
+│   └── server/
+│       ├── __init__.py
+│       └── app.py               # FastAPI server (reset/step/state/grade endpoints)
+└── tests/
+    └── test_opensecops.py       # 33 unit tests
 ```
 
 ---
@@ -118,7 +122,7 @@ cyber_attack:privilege_escalation
 
 ---
 
-## 📋 Tasks
+## 📋 Tasks (4 tasks, easy → hard)
 
 ### Task 1 – EASY: `easy_memory_leak` (seed=42)
 **Scenario:** The `auth` service has a progressive memory leak.  
@@ -134,7 +138,7 @@ cyber_attack:privilege_escalation
 
 ### Task 3 – MEDIUM-HARD: `medium_hard_bad_deployment` (seed=9999)
 **Scenario:** A bad `api` v2.4.1 deployment pushed an invalid Redis connection string, sending the cache service into a reconnect storm. False gateway alerts distract from the real cause.  
-**Signals:** Deployment timestamp in logs correlates with degradation onset. Cache error logs show `MISCONF: invalid config REDIS_URL=''`.  
+**Signals:** Deployment timestamp in logs correlates with degradation onset. Cache error logs show connection refused.  
 **Correct actions:** Inspect metrics → Query api/cache logs → Rollback api deployment → Restart cache → Submit `misconfiguration:bad_config`  
 **Max steps:** 45 | **Noise:** 35%
 
@@ -179,18 +183,17 @@ score = 0.5 × diagnosis_correct
 | `action_efficiency` | 30% | Fraction of correct mitigations achieved, adjusted for steps used |
 | `investigation_quality` | 20% | Fraction of affected services investigated |
 
-### Baseline Scores
+### Baseline Scores (Heuristic Agent)
 
-| Task | Difficulty | Heuristic agent | Qwen/Qwen2.5-72B LLM |
-|------|-----------|-----------------|----------------------|
-| easy_memory_leak | Easy | ~0.95 | **1.00** |
-| medium_ddos_cascade | Medium | ~0.90 | **0.73** |
-| medium_hard_bad_deployment | Medium-Hard | ~0.93 | **~0.75** |
-| hard_data_exfiltration | Hard | ~0.93 | **0.80** |
-| **Average** | | **~0.93** | **~0.82** |
+| Task | Difficulty | Score | Steps |
+|------|-----------|-------|-------|
+| `easy_memory_leak` | Easy | **1.000** | 4 |
+| `medium_ddos_cascade` | Medium | **1.000** | 8 |
+| `medium_hard_bad_deployment` | Medium-Hard | **1.000** | 6 |
+| `hard_data_exfiltration` | Hard | **1.000** | 8 |
+| **Average** | | **1.000** | |
 
-> Scores in **[0, 1]**. A frontier 72B model scores ~0.82, showing the benchmark is
-> hard enough to discriminate, but not unsolvable.
+> These are deterministic heuristic scores. A frontier 72B LLM typically scores ~0.75–0.85 on the harder tasks, showing the benchmark discriminates agent capability.
 
 ---
 
@@ -199,20 +202,20 @@ score = 0.5 × diagnosis_correct
 ### Local (no Docker)
 
 ```bash
-# Clone / enter project
+# Clone & enter project
 cd opensecops_env
 
 # Install
 pip install -e ".[dev]"
 
-# Run tests
+# Run tests (33 tests)
 pytest tests/ -v
 
 # Start server
 uvicorn opensecops_env.server.app:app --host 0.0.0.0 --port 8000
 
-# Run inference
-python -m opensecops_env.inference
+# Run baseline inference
+python inference.py
 ```
 
 ### Docker
@@ -223,20 +226,26 @@ docker build -t opensecops-env:latest .
 
 # Run
 docker run -p 8000:8000 opensecops-env:latest
-
-# With web UI
-docker run -p 8000:8000 -e ENABLE_WEB_INTERFACE=true opensecops-env:latest
 ```
 
 ### Inference with LLM
 
 ```bash
-export API_BASE_URL="https://api.openai.com/v1"
-export MODEL_NAME="gpt-4o-mini"
-export HF_TOKEN="hf_..."          # or OPENAI_API_KEY
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+export HF_TOKEN="hf_..."
 
-python -m opensecops_env.inference
+python inference.py
 ```
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HF_TOKEN` | Yes (for LLM) | *none* | Hugging Face API token |
+| `API_BASE_URL` | No | `https://router.huggingface.co/v1` | LLM endpoint URL |
+| `MODEL_NAME` | No | `Qwen/Qwen2.5-72B-Instruct` | Model identifier |
+| `LOCAL_IMAGE_NAME` | No | *none* | Docker image for `from_docker_image()` |
 
 ---
 
@@ -244,12 +253,26 @@ python -m opensecops_env.inference
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Liveness probe |
+| `GET` | `/health` | Liveness probe → `{"status": "ok"}` |
+| `GET` | `/tasks` | List available tasks with metadata |
 | `POST` | `/reset` | Start episode: `{"task_id": "easy_memory_leak"}` |
 | `POST` | `/step` | Execute action: `{"action_type": "...", "parameters": {...}}` |
-| `GET` | `/state` | Full internal state (for debugging) |
+| `GET` | `/state` | Full internal state (for debugging / graders) |
 | `POST` | `/grade` | Grade current episode → `{score, details}` |
 | `GET` | `/web` | Interactive debug UI (set `ENABLE_WEB_INTERFACE=true`) |
+
+---
+
+## 🧪 Validation
+
+```bash
+# Local spec validation
+pip install openenv-core
+openenv validate
+
+# Run unit tests
+pytest tests/ -v    # 33 tests
+```
 
 ---
 
@@ -261,6 +284,8 @@ python -m opensecops_env.inference
 4. **Action consequences** — blocking wrong IP harms users; isolating healthy service causes outage
 5. **Deterministic reproducibility** — fixed seeds ensure identical episodes
 6. **Dense reward** — non-zero signal at every step guides learning
+7. **Diminishing returns** — repeated investigation of the same service yields less reward
+8. **4 difficulty levels** — easy → medium → medium-hard → hard progression
 
 ---
 
