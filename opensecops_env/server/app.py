@@ -23,7 +23,7 @@ to run different tasks without colliding.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -121,8 +121,10 @@ def list_tasks() -> dict[str, Any]:
 
 
 @app.post("/reset")
-def reset(req: ResetRequest) -> dict[str, Any]:
+def reset(req: Optional[ResetRequest] = None) -> dict[str, Any]:
     """Start a new episode. Returns the initial observation."""
+    if req is None:
+        req = ResetRequest()
     session_id = req.session_id or req.task_id
     try:
         env = OpenSecOpsEnv()
