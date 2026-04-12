@@ -123,7 +123,7 @@ def grade(episode_state: dict[str, Any]) -> GradeResult:
         + 0.3 * action_efficiency
         + 0.2 * investigation_quality
     )
-    score = round(max(0.0, min(1.0, score)), 4)
+    score = round(max(0.01, min(0.99, score)), 4)
 
     details = {
         "submitted_label": submitted_label,
