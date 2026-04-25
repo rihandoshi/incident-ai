@@ -1013,20 +1013,94 @@ def _build_web_ui() -> str:
 <meta charset="UTF-8">
 <title>OpenSecOpsEnv – Debug UI</title>
 <style>
-  body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
-  h1   { color: #58a6ff; }
-  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
-  button { background: #238636; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
-  button:hover { background: #2ea043; }
-  input, select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; }
-  pre  { white-space: pre-wrap; word-break: break-word; font-size: 12px; }
-  .reward { color: #3fb950; font-weight: bold; }
-  .penalty { color: #f85149; font-weight: bold; }
+  :root {
+    --bg: #070d1a;
+    --surface: #101a2f;
+    --surface2: #18243f;
+    --border: #2b3f67;
+    --text: #d9e5ff;
+    --text2: #93a8cb;
+    --blue: #60a5fa;
+    --green: #22c55e;
+    --red: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Inter, Segoe UI, sans-serif;
+    background:
+      radial-gradient(circle at 10% -20%, rgba(59,130,246,0.25), transparent 38%),
+      linear-gradient(180deg, #060b17 0%, #070d1a 100%);
+    color: var(--text);
+    padding: 28px 16px;
+  }
+  .shell {
+    max-width: 1000px;
+    margin: 0 auto;
+    border: 1px solid rgba(43,63,103,0.65);
+    background: rgba(9,15,29,0.82);
+    border-radius: 16px;
+    padding: 20px;
+    box-shadow: 0 20px 44px rgba(2,8,23,0.45);
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 24px;
+    color: #8bb9ff;
+    letter-spacing: -0.01em;
+  }
+  .subtle-link { color: var(--blue); text-decoration: none; font-weight: 600; }
+  .subtle-link:hover { text-decoration: underline; }
+  .panel {
+    background: linear-gradient(180deg, var(--surface2), var(--surface));
+    border: 1px solid rgba(43,63,103,0.72);
+    border-radius: 12px;
+    padding: 14px;
+    margin-top: 14px;
+  }
+  h3 {
+    margin: 0 0 10px;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text2);
+  }
+  button {
+    background: #2563eb;
+    color: #fff;
+    border: 1px solid #2563eb;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  button:hover { background: #1d4ed8; }
+  input, select {
+    background: #101a2f;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    border-radius: 8px;
+  }
+  pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    line-height: 1.5;
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    background: rgba(7,13,26,0.75);
+    border: 1px solid rgba(43,63,103,0.55);
+    border-radius: 10px;
+    padding: 12px;
+  }
+  .reward { color: var(--green); font-weight: 700; }
+  .penalty { color: var(--red); font-weight: 700; }
 </style>
 </head>
 <body>
-<h1>🔐 OpenSecOpsEnv – Debug UI</h1>
-<p><a href="/dashboard" style="color:#58a6ff">→ Open Live Dashboard</a></p>
+<div class="shell">
+<h1>OpenSecOpsEnv Debug Console</h1>
+<p><a class="subtle-link" href="/dashboard">→ Open Live Dashboard</a></p>
 <div class="panel">
   <h3>Reset</h3>
   <select id="task_id">
@@ -1054,6 +1128,7 @@ def _build_web_ui() -> str:
   <button onclick="doState()">Fetch Full State</button>
   <button onclick="doGrade()">Grade Episode</button>
   <pre id="state_out">—</pre>
+</div>
 </div>
 <script>
 async function doReset() {
@@ -1093,138 +1168,167 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>OpenSecOpsEnv — Attacker vs Defender</title>
 <meta name="description" content="Live AI Demo: Red Attacker vs Blue Defender agent battle with self-improving curriculum learning. OpenEnv Hackathon submission.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Poppins:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0a0f1e;
-    --bg2: #0d1426;
-    --bg3: #111827;
-    --bg4: #1a2235;
-    --border: #1e2d45;
-    --border2: #253347;
-    --blue: #3b82f6;
-    --blue-bright: #60a5fa;
-    --green: #10b981;
-    --red: #ef4444;
-    --red-bright: #f87171;
-    --orange: #f59e0b;
-    --yellow: #eab308;
-    --purple: #8b5cf6;
-    --cyan: #06b6d4;
-    --text: #e2e8f0;
-    --text2: #94a3b8;
-    --text3: #64748b;
-    --card-shadow: 0 2px 8px rgba(0,0,0,0.4);
-    --glow-blue: 0 0 20px rgba(59,130,246,0.15);
-    --glow-red: 0 0 20px rgba(239,68,68,0.15);
-    --glow-green: 0 0 20px rgba(16,185,129,0.15);
+    --bg: #f5f7fb;
+    --bg2: #ffffff;
+    --bg3: #f8fafc;
+    --bg4: #eff3f9;
+    --surface: #ffffff;
+    --surface-strong: #f8fafc;
+    --border: #dbe3ef;
+    --border2: #c6d3e6;
+    --blue: #1f3b73;
+    --blue-bright: #2a4f95;
+    --green: #0f9f64;
+    --red: #cf3a37;
+    --red-bright: #b72e2b;
+    --orange: #7c3aed;
+    --yellow: #d99800;
+    --purple: #6b4de6;
+    --cyan: #0ea5a6;
+    --text: #132238;
+    --text2: #334861;
+    --text3: #657a95;
+    --card-shadow: 0 10px 24px rgba(15, 31, 58, 0.08);
+    --glow-blue: 0 0 0 rgba(0,0,0,0);
+    --glow-red: 0 0 0 rgba(0,0,0,0);
+    --glow-green: 0 0 0 rgba(0,0,0,0);
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: 'Inter', sans-serif;
+    font-family: 'Poppins', 'Inter', sans-serif;
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
     overflow-x: hidden;
+    background: linear-gradient(180deg, #f7f9fd 0%, #f2f6fb 100%);
+  }
+  .app {
+    width: min(1480px, 100%);
+    margin: 0 auto;
+    border-left: 1px solid rgba(180,198,223,0.45);
+    border-right: 1px solid rgba(180,198,223,0.45);
+    min-height: 100vh;
+    background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,251,255,0.98));
+    box-shadow: none;
   }
 
   /* ---- Header ---- */
   .header {
     border-bottom: 1px solid var(--border);
-    padding: 10px 20px;
+    padding: 12px 24px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: var(--bg2);
+    background: #ffffff;
     position: sticky;
     top: 0;
     z-index: 100;
-    backdrop-filter: blur(12px);
+    backdrop-filter: blur(10px);
   }
   .header-left { display: flex; align-items: center; gap: 12px; }
   .logo {
-    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600;
-    color: var(--blue-bright); letter-spacing: -0.02em;
+    font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600;
+    color: var(--blue-bright); letter-spacing: -0.01em;
+    text-shadow: none;
   }
-  .logo span { color: var(--text2); font-weight: 400; }
+  .logo span { color: var(--purple); font-weight: 600; }
   .badge {
     font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
     padding: 3px 8px; border-radius: 4px; text-transform: uppercase;
   }
-  .badge-openenv { background: rgba(59,130,246,0.15); color: var(--blue-bright); border: 1px solid rgba(59,130,246,0.3); }
-  .badge-live { background: rgba(239,68,68,0.15); color: var(--red-bright); border: 1px solid rgba(239,68,68,0.3); animation: pulse-badge 1.5s infinite; }
-  @keyframes pulse-badge { 0%,100%{opacity:1} 50%{opacity:0.5} }
-  .badge-self-improve { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
+  .badge-openenv { background: rgba(31,59,115,0.08); color: var(--blue-bright); border: 1px solid rgba(31,59,115,0.2); }
+  .badge-live { background: rgba(14,165,166,0.14); color: #0f7879; border: 1px solid rgba(14,165,166,0.28); }
+  .badge-self-improve { background: rgba(107,77,230,0.1); color: #5b3cd7; border: 1px solid rgba(107,77,230,0.24); }
   .header-right { display: flex; align-items: center; gap: 16px; }
   .header-status { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text3); }
-  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse-dot 2s infinite; }
-  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #11a36c; }
 
   /* ---- Tab bar ---- */
   .tab-bar {
     display: flex;
     border-bottom: 1px solid var(--border);
-    background: var(--bg2);
-    padding: 0 20px;
-    gap: 4px;
+    background: #ffffff;
+    padding: 8px 24px 0;
+    gap: 8px;
   }
   .tab {
-    padding: 9px 18px; font-size: 12px; font-weight: 600;
+    padding: 10px 16px; font-size: 12px; font-weight: 600;
     color: var(--text3); cursor: pointer; border: none; background: none;
-    border-bottom: 2px solid transparent; transition: all 0.2s;
+    border-bottom: 2px solid transparent; transition: all 0.2s ease;
     display: flex; align-items: center; gap: 6px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
   }
-  .tab:hover { color: var(--text2); }
-  .tab.active { color: var(--blue-bright); border-bottom-color: var(--blue-bright); }
+  .tab:hover { color: var(--blue-bright); background: #f2f6fd; }
+  .tab.active {
+    color: #ffffff;
+    border-bottom-color: transparent;
+    background: linear-gradient(90deg, #6b4de6, #0ea5a6);
+    box-shadow: none;
+  }
   .tab-panel { display: none; }
   .tab-panel.active { display: flex; flex-direction: column; }
 
   /* ---- Controls bar ---- */
   .controls {
-    padding: 10px 20px;
+    padding: 14px 18px;
+    margin: 14px 18px 0;
     display: flex;
     align-items: center;
-    gap: 10px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg2);
+    gap: 12px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: var(--card-shadow);
     flex-wrap: wrap;
   }
   .control-group { display: flex; flex-direction: column; gap: 3px; }
   .control-label { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); }
   select, .btn {
     font-family: 'Inter', sans-serif; font-size: 12px;
-    border-radius: 6px; border: 1px solid var(--border2);
-    background: var(--bg3); color: var(--text);
-    padding: 6px 11px; cursor: pointer; outline: none;
-    transition: border-color 0.15s, background 0.15s;
+    border-radius: 8px; border: 1px solid var(--border2);
+    background: #ffffff; color: var(--text);
+    padding: 8px 12px; cursor: pointer; outline: none;
+    transition: border-color 0.15s, background 0.15s, transform 0.12s ease;
   }
-  select:hover, select:focus { border-color: var(--blue); background: var(--bg4); }
+  select:hover, select:focus { border-color: var(--orange); background: #ffffff; }
   .btn { font-weight: 600; display: flex; align-items: center; gap: 5px; }
-  .btn-primary { background: var(--blue); color: #fff; border-color: var(--blue); }
-  .btn-primary:hover { background: #2563eb; }
+  .btn-primary { background: var(--orange); color: #fff; border-color: var(--orange); }
+  .btn-primary:hover { background: #6d33d8; transform: translateY(-1px); box-shadow: 0 6px 14px rgba(107,77,230,0.28); }
   .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
   .btn-red { background: rgba(239,68,68,0.2); color: var(--red-bright); border-color: rgba(239,68,68,0.3); }
   .btn-red:hover { background: rgba(239,68,68,0.3); }
-  .btn-ghost { background: transparent; color: var(--text3); border-color: var(--border2); }
-  .btn-ghost:hover { color: var(--text2); border-color: var(--border); background: var(--bg4); }
+  .btn-ghost { background: transparent; color: var(--text2); border-color: var(--border2); }
+  .btn-ghost:hover { color: var(--blue); border-color: var(--blue); background: #f3f7fd; }
   .mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid var(--border2); }
   .mode-btn { padding: 6px 13px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; background: var(--bg3); color: var(--text3); border: none; }
-  .mode-btn.active-trained { background: rgba(16,185,129,0.15); color: var(--green); }
-  .mode-btn.active-untrained { background: rgba(239,68,68,0.15); color: var(--red-bright); }
+  .mode-btn.active-trained { background: rgba(15,159,100,0.12); color: var(--green); }
+  .mode-btn.active-untrained { background: rgba(207,58,55,0.12); color: var(--red-bright); }
 
   /* ---- Main layout ---- */
-  .main { display: grid; grid-template-columns: 300px 1fr 280px; height: calc(100vh - 104px); }
+  .main {
+    display: grid;
+    grid-template-columns: 300px 1fr 280px;
+    height: calc(100vh - 132px);
+    gap: 14px;
+    padding: 14px 18px 18px;
+  }
 
   /* ---- Panel base ---- */
   .panel {
-    border-right: 1px solid var(--border);
+    border: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    background: var(--bg);
+    background: #ffffff;
+    border-radius: 14px;
+    box-shadow: var(--card-shadow);
   }
   .panel-header {
     padding: 9px 14px;
@@ -1233,7 +1337,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     color: var(--text3);
     display: flex; align-items: center; justify-content: space-between;
     flex-shrink: 0;
-    background: var(--bg2);
+    background: #f8fafd;
   }
   .panel-dot { width: 6px; height: 6px; border-radius: 50%; }
   .panel-body { flex: 1; overflow-y: auto; padding: 12px; }
@@ -1243,21 +1347,21 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* ---- Scenario card ---- */
   .scenario-card {
-    background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(139,92,246,0.08));
-    border: 1px solid rgba(59,130,246,0.2);
+    background: #f7faff;
+    border: 1px solid #d7e3f3;
     border-radius: 8px; padding: 11px; margin-bottom: 11px;
   }
-  .scenario-name { font-size: 12px; font-weight: 600; color: var(--blue-bright); margin-bottom: 3px; }
+  .scenario-name { font-size: 12px; font-weight: 600; color: var(--blue); margin-bottom: 3px; }
   .scenario-desc { font-size: 10px; color: var(--text3); line-height: 1.5; }
   .difficulty-badge {
     display: inline-flex; align-items: center; gap: 4px;
     font-size: 9px; font-weight: 700; border-radius: 4px; padding: 2px 7px; margin-top: 5px;
     letter-spacing: 0.06em; text-transform: uppercase;
   }
-  .diff-easy { background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
-  .diff-medium { background: rgba(234,179,8,0.15); color: var(--yellow); border: 1px solid rgba(234,179,8,0.3); }
-  .diff-medium_hard { background: rgba(245,158,11,0.15); color: var(--orange); border: 1px solid rgba(245,158,11,0.3); }
-  .diff-hard { background: rgba(239,68,68,0.15); color: var(--red-bright); border: 1px solid rgba(239,68,68,0.3); }
+  .diff-easy { background: rgba(15,159,100,0.12); color: var(--green); border: 1px solid rgba(15,159,100,0.22); }
+  .diff-medium { background: rgba(217,152,0,0.13); color: var(--yellow); border: 1px solid rgba(217,152,0,0.24); }
+  .diff-medium_hard { background: rgba(255,122,26,0.13); color: #c65c08; border: 1px solid rgba(255,122,26,0.24); }
+  .diff-hard { background: rgba(207,58,55,0.12); color: var(--red-bright); border: 1px solid rgba(207,58,55,0.22); }
 
   /* ---- Section title ---- */
   .section-title {
@@ -1278,7 +1382,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .metric-bar-bg { flex: 1; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
   .metric-bar-fill { height: 100%; border-radius: 2px; transition: width 0.6s cubic-bezier(0.4,0,0.2,1), background 0.6s; }
   .bar-ok { background: var(--green); }
-  .bar-warn { background: var(--orange); }
+  .bar-warn { background: var(--cyan); }
   .bar-crit { background: var(--red); }
   .metric-err { font-family: 'JetBrains Mono', monospace; font-size: 9px; text-align: right; }
 
@@ -1291,8 +1395,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   @keyframes slide-in { from { opacity:0; transform: translateX(-5px); } to { opacity:1; transform: translateX(0); } }
   .alert-critical { background: rgba(239,68,68,0.1); border-color: var(--red); color: var(--red-bright); }
-  .alert-warning  { background: rgba(245,158,11,0.1); border-color: var(--orange); color: var(--orange); }
-  .alert-info     { background: rgba(59,130,246,0.1); border-color: var(--blue); color: var(--blue-bright); }
+  .alert-warning  { background: rgba(14,165,166,0.1); border-color: var(--cyan); color: var(--cyan); }
+  .alert-info     { background: rgba(31,59,115,0.08); border-color: var(--blue); color: var(--blue); }
   .alert-red-injected { border-color: #f43f5e; background: rgba(244,63,94,0.12); }
   .alert-sev { font-size: 8px; font-weight: 700; letter-spacing: 0.06em; margin-bottom: 1px; opacity: 0.8; }
   .alert-msg { font-size: 10px; line-height: 1.4; }
@@ -1312,18 +1416,26 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .topo-arrow { color: var(--text3); font-size: 10px; }
 
   /* ---- Center Panel: Battle Feed ---- */
-  .center-panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--bg); }
+  .center-panel {
+    border: 1px solid rgba(46,68,105,0.5);
+    display: flex;
+    flex-direction: column;
+    background: #ffffff;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: var(--card-shadow);
+  }
   .battle-feed { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 7px; }
   .battle-feed::-webkit-scrollbar { width: 3px; }
   .battle-feed::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
   /* Battle cards */
   .action-card {
-    background: var(--bg3); border: 1px solid var(--border);
+    background: #ffffff; border: 1px solid var(--border);
     border-radius: 8px; padding: 10px 13px;
-    animation: card-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    animation: card-in 0.18s ease;
   }
-  @keyframes card-in { from { opacity:0; transform: translateY(8px) scale(0.98); } to { opacity:1; transform: translateY(0) scale(1); } }
+  @keyframes card-in { from { opacity:0; transform: translateY(5px); } to { opacity:1; transform: translateY(0); } }
   .action-card.blue-card { border-left: 3px solid var(--blue); box-shadow: var(--glow-blue); }
   .action-card.red-card  { border-left: 3px solid var(--red);  box-shadow: var(--glow-red); }
   .action-card.positive  { border-left-color: var(--green); }
@@ -1341,7 +1453,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     padding: 2px 6px; border-radius: 3px;
   }
   .type-mitigation   { background: rgba(139,92,246,0.15); color: #a78bfa; }
-  .type-investigation{ background: rgba(59,130,246,0.15); color: var(--blue-bright); }
+  .type-investigation{ background: rgba(31,59,115,0.1); color: var(--blue); }
   .type-terminal     { background: rgba(234,179,8,0.15); color: var(--yellow); }
   .type-red-attack   { background: rgba(239,68,68,0.15); color: var(--red-bright); }
   .action-result { font-size: 11px; color: var(--text2); line-height: 1.5; }
@@ -1359,24 +1471,20 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     display: flex; align-items: center; gap: 7px;
     padding: 9px 12px; border-radius: 7px;
     background: var(--bg3); border: 1px dashed var(--border2);
-    font-size: 11px; color: var(--text3); animation: thinking-pulse 1.5s infinite;
+    font-size: 11px; color: var(--text3);
   }
-  @keyframes thinking-pulse { 0%,100%{opacity:0.6} 50%{opacity:1} }
   .thinking-dots span {
     display: inline-block; width: 4px; height: 4px; border-radius: 50%;
     background: var(--blue); margin: 0 1px;
-    animation: dot-bounce 1.2s infinite;
+    opacity: 0.75;
   }
-  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes dot-bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
 
   /* Log stream */
   .log-stream {
     border-top: 1px solid var(--border);
     height: 110px; overflow-y: auto;
     padding: 7px 13px; flex-shrink: 0;
-    background: #050b14;
+    background: #f6f9fd;
   }
   .log-stream::-webkit-scrollbar { width: 2px; }
   .log-stream::-webkit-scrollbar-thumb { background: var(--border2); }
@@ -1384,24 +1492,32 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .log-error { color: #f87171; }
   .log-warn  { color: #fbbf24; }
   .log-crit  { color: #fb923c; font-weight: 600; }
-  .log-info  { color: var(--text3); }
+  .log-info  { color: #6f839d; }
   .log-red   { color: #f43f5e; font-weight: 600; }
 
   /* ---- Right Panel ---- */
-  .right-panel { display: flex; flex-direction: column; background: var(--bg); }
+  .right-panel {
+    display: flex;
+    flex-direction: column;
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: var(--card-shadow);
+  }
   .chart-wrap { padding: 11px 13px; border-bottom: 1px solid var(--border); }
 
   /* Score grid */
   .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 11px 13px; border-bottom: 1px solid var(--border); }
   .score-card {
-    background: var(--bg3); border: 1px solid var(--border);
+    background: rgba(23,33,59,0.82); border: 1px solid rgba(42,60,97,0.52);
     border-radius: 7px; padding: 9px; text-align: center;
   }
   .score-val { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
   .score-lbl { font-size: 8px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text3); margin-top: 2px; }
-  .score-big { grid-column: 1 / -1; background: rgba(59,130,246,0.08); border-color: rgba(59,130,246,0.2); }
-  .score-blue { background: rgba(59,130,246,0.08); border-color: rgba(59,130,246,0.2); }
-  .score-red  { background: rgba(239,68,68,0.08);  border-color: rgba(239,68,68,0.2); }
+  .score-big { grid-column: 1 / -1; background: #f7fbff; border-color: #d7e5f6; }
+  .score-blue { background: #f7fbff; border-color: #d7e5f6; }
+  .score-red  { background: #fff8f8; border-color: #f3dddd; }
 
   /* Progress bars */
   .progress-wrap { padding: 11px 13px; flex: 1; overflow-y: auto; }
@@ -1436,7 +1552,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-radius: 14px; padding: 32px; text-align: center;
     max-width: 500px; width: 92%;
     box-shadow: 0 24px 50px rgba(0,0,0,0.5);
-    animation: card-in 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    animation: card-in 0.2s ease;
   }
   .end-icon { font-size: 40px; margin-bottom: 8px; }
   .end-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
@@ -1488,6 +1604,18 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (max-width: 1100px) {
     .main { grid-template-columns: 240px 1fr 240px; }
   }
+  @media (max-width: 900px) {
+    .header { padding: 10px 14px; }
+    .tab-bar { padding: 6px 12px 0; overflow-x: auto; }
+    .controls { margin: 10px 12px 0; padding: 10px 12px; }
+    .main {
+      grid-template-columns: 1fr;
+      height: auto;
+      min-height: 58vh;
+      padding: 10px 12px 14px;
+    }
+    .panel, .center-panel, .right-panel { min-height: 280px; }
+  }
 </style>
 </head>
 <body>
@@ -1497,8 +1625,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="header">
   <div class="header-left">
     <span class="logo">OpenSecOps<span>Env</span></span>
-    <span class="badge badge-openenv">OpenEnv</span>
-    <span class="badge badge-self-improve">🧠 Self-Improving</span>
+    <span class="badge badge-openenv">Platform</span>
+    <span class="badge badge-self-improve">Adaptive Learning</span>
     <span class="badge badge-live" id="liveBadge" style="display:none">● Live</span>
   </div>
   <div class="header-right">
@@ -1511,9 +1639,9 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- Tab bar -->
 <div class="tab-bar">
-  <button class="tab active" id="tab-single"   onclick="switchTab('single')">🤖 Agent Demo</button>
-  <button class="tab"        id="tab-battle"   onclick="switchTab('battle')">⚔️ Battle Mode</button>
-  <button class="tab"        id="tab-improve"  onclick="switchTab('improve')">📈 Self-Improvement</button>
+  <button class="tab active" id="tab-single"   onclick="switchTab('single')">Agent</button>
+  <button class="tab"        id="tab-battle"   onclick="switchTab('battle')">Battle</button>
+  <button class="tab"        id="tab-improve"  onclick="switchTab('improve')">Learning</button>
 </div>
 
 <!-- ═══════════════════════════════ TAB: Single Agent ═══════════════════════════════ -->
@@ -1523,17 +1651,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="control-group">
       <span class="control-label">Scenario</span>
       <select id="scenarioSelect">
-        <option value="easy_memory_leak">🟢 Memory Leak — Easy</option>
-        <option value="medium_ddos_cascade">🟡 DDoS Cascade — Medium</option>
-        <option value="medium_hard_bad_deployment">🟠 Bad Deployment — Medium-Hard</option>
-        <option value="hard_data_exfiltration" selected>🔴 Data Exfiltration — Hard</option>
+        <option value="easy_memory_leak">Memory Leak - Easy</option>
+        <option value="medium_ddos_cascade">DDoS Cascade - Medium</option>
+        <option value="medium_hard_bad_deployment">Bad Deployment - Medium-Hard</option>
+        <option value="hard_data_exfiltration" selected>Data Exfiltration - Hard</option>
       </select>
     </div>
     <div class="control-group">
       <span class="control-label">Agent Mode</span>
       <div class="mode-toggle">
-        <button class="mode-btn active-trained" id="modeTrainedBtn"   onclick="setMode('trained')">✦ Trained AI</button>
-        <button class="mode-btn"                id="modeUntrainedBtn" onclick="setMode('untrained')">✗ Untrained</button>
+        <button class="mode-btn active-trained" id="modeTrainedBtn"   onclick="setMode('trained')">Trained Model</button>
+        <button class="mode-btn"                id="modeUntrainedBtn" onclick="setMode('untrained')">Baseline Model</button>
       </div>
     </div>
     <div class="control-group">
@@ -1544,9 +1672,9 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         <option value="2.5">Slow (Demo)</option>
       </select>
     </div>
-    <button class="btn btn-primary" id="startBtn" onclick="startDemo()">▶ Run Episode</button>
-    <button class="btn btn-ghost" onclick="resetUI()">↺ Reset</button>
-    <button class="btn btn-ghost" onclick="showComparison()">⇄ Compare</button>
+    <button class="btn btn-primary" id="startBtn" onclick="startDemo()">Run Episode</button>
+    <button class="btn btn-ghost" onclick="resetUI()">Reset</button>
+    <button class="btn btn-ghost" onclick="showComparison()">Compare</button>
   </div>
 
   <!-- 3-col layout -->
@@ -1569,7 +1697,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="panel-dot" style="background:var(--purple)"></div>
       </div>
       <div class="battle-feed" id="actionFeed">
-        <div class="empty-state">🤖 The agent will appear here<br>as it investigates the incident.</div>
+        <div class="empty-state">Agent actions appear here<br>during incident analysis.</div>
       </div>
       <div class="log-stream" id="logStream">
         <div class="log-line log-info">// System logs will stream here...</div>
@@ -1624,10 +1752,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="control-group">
       <span class="control-label">Scenario</span>
       <select id="battleScenarioSelect">
-        <option value="easy_memory_leak">🟢 Memory Leak — Easy</option>
-        <option value="medium_ddos_cascade">🟡 DDoS Cascade — Medium</option>
-        <option value="medium_hard_bad_deployment">🟠 Bad Deployment — Medium-Hard</option>
-        <option value="hard_data_exfiltration" selected>🔴 Data Exfiltration — Hard</option>
+        <option value="easy_memory_leak">Memory Leak - Easy</option>
+        <option value="medium_ddos_cascade">DDoS Cascade - Medium</option>
+        <option value="medium_hard_bad_deployment">Bad Deployment - Medium-Hard</option>
+        <option value="hard_data_exfiltration" selected>Data Exfiltration - Hard</option>
       </select>
     </div>
     <div class="control-group">
@@ -1638,12 +1766,12 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         <option value="2.0">Slow (Demo)</option>
       </select>
     </div>
-    <button class="btn btn-primary" id="battleStartBtn" onclick="startBattle()">⚔️ Start Battle</button>
-    <button class="btn btn-ghost"   onclick="resetBattle()">↺ Reset</button>
+    <button class="btn btn-primary" id="battleStartBtn" onclick="startBattle()">Start Battle</button>
+    <button class="btn btn-ghost"   onclick="resetBattle()">Reset</button>
     <div style="margin-left:auto; display:flex; gap:10px; align-items:center; font-size:11px;">
-      <span style="color:var(--blue-bright); font-weight:600">🔵 Defender</span>
+      <span style="color:var(--blue-bright); font-weight:600">Defender</span>
       <span style="color:var(--text3)">vs</span>
-      <span style="color:var(--red-bright); font-weight:600">🔴 Attacker</span>
+      <span style="color:var(--red-bright); font-weight:600">Attacker</span>
     </div>
   </div>
 
@@ -1656,18 +1784,18 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="panel-dot" style="background:var(--red)"></div>
       </div>
       <div class="panel-body" id="battleLeftPanel">
-        <div class="empty-state">Click <strong>⚔️ Start Battle</strong><br>to launch the live battle.</div>
+        <div class="empty-state">Click <strong>Start Battle</strong><br>to launch live simulation.</div>
       </div>
     </div>
 
     <!-- CENTER: Battle Feed -->
     <div class="center-panel">
       <div class="panel-header">
-        <span id="battleFeedTitle">⚔️ Battle Feed</span>
+        <span id="battleFeedTitle">Battle Feed</span>
         <div class="panel-dot" style="background:var(--purple)"></div>
       </div>
       <div class="battle-feed" id="battleFeed">
-        <div class="empty-state">🔴 Attacker vs 🔵 Defender<br>will stream here in real-time.</div>
+        <div class="empty-state">Attacker and defender actions<br>stream here in real time.</div>
       </div>
       <div class="log-stream" id="battleLogStream">
         <div class="log-line log-info">// Combat logs will appear here...</div>
@@ -1686,11 +1814,11 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="score-grid">
         <div class="score-card score-blue">
           <div class="score-val" id="blueScore" style="color:var(--blue-bright)">0.00</div>
-          <div class="score-lbl">🔵 Defender</div>
+          <div class="score-lbl">Defender</div>
         </div>
         <div class="score-card score-red">
           <div class="score-val" id="redScore" style="color:var(--red-bright)">0.00</div>
-          <div class="score-lbl">🔴 Attacker</div>
+          <div class="score-lbl">Attacker</div>
         </div>
         <div class="score-card score-big">
           <div class="score-val" id="battleFinalScore" style="color:var(--text3)">—</div>
@@ -1744,11 +1872,11 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div style="background:linear-gradient(135deg,rgba(139,92,246,0.08),rgba(59,130,246,0.08)); border:1px solid rgba(139,92,246,0.2); border-radius:8px; padding:14px;">
         <div class="section-title">How Self-Improvement Works</div>
         <div style="font-size:11px; color:var(--text3); line-height:1.7;">
-          <div style="margin-bottom:6px">1. 🎯 <strong style="color:var(--text2)">Start at Level 1</strong> — easy tasks (memory leak)</div>
-          <div style="margin-bottom:6px">2. 📊 <strong style="color:var(--text2)">Score is tracked</strong> over a rolling window of 5 episodes</div>
-          <div style="margin-bottom:6px">3. ⬆️ <strong style="color:var(--text2)">Level up automatically</strong> when avg score exceeds threshold</div>
-          <div style="margin-bottom:6px">4. 🔴 <strong style="color:var(--red-bright)">Attacker gets harder</strong> as Blue agent improves</div>
-          <div>5. 🏆 <strong style="color:var(--green)">Level 5</strong> = expert: handle disguised data exfiltration + active attacker</div>
+          <div style="margin-bottom:6px">1. <strong style="color:var(--text2)">Start at Level 1</strong> with foundational scenarios.</div>
+          <div style="margin-bottom:6px">2. <strong style="color:var(--text2)">Track score</strong> over a rolling window of five episodes.</div>
+          <div style="margin-bottom:6px">3. <strong style="color:var(--text2)">Promote level automatically</strong> when thresholds are met.</div>
+          <div style="margin-bottom:6px">4. <strong style="color:var(--red-bright)">Increase attacker pressure</strong> as defender capability improves.</div>
+          <div>5. <strong style="color:var(--green)">Level 5</strong> reflects expert readiness for disguised exfiltration scenarios.</div>
         </div>
       </div>
     </div>
@@ -1758,17 +1886,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <!-- Episode End Modal -->
 <div class="episode-end" id="episodeEnd">
   <div class="end-card">
-    <div class="end-icon" id="endIcon">🎯</div>
+    <div class="end-icon" id="endIcon">Result</div>
     <div class="end-title" id="endTitle">Episode Complete</div>
     <div class="end-score" id="endScore">—</div>
     <div class="end-vs" id="endVs" style="display:none">
       <div class="end-col end-col-blue">
-        <div class="end-col-title">🔵 Defender</div>
+        <div class="end-col-title">Defender</div>
         <div class="end-col-score" id="endBlueScore">—</div>
       </div>
       <div class="vs-label">VS</div>
       <div class="end-col end-col-red">
-        <div class="end-col-title">🔴 Attacker</div>
+        <div class="end-col-title">Attacker</div>
         <div class="end-col-score" id="endRedScore">—</div>
       </div>
     </div>
@@ -1777,7 +1905,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       Trained: <span id="cmpTrained" style="color:var(--green); font-weight:700"></span> &nbsp;|&nbsp;
       Untrained: <span id="cmpUntrained" style="color:var(--red-bright); font-weight:700"></span>
     </div>
-    <button class="btn btn-primary" onclick="closeEnd()" style="margin:0 auto;display:flex">↺ Run Again</button>
+    <button class="btn btn-primary" onclick="closeEnd()" style="margin:0 auto;display:flex">Run Again</button>
   </div>
 </div>
 
@@ -1831,11 +1959,11 @@ const RED_ACTION_CLASS = {
 };
 
 const ACTION_ICON = {
-  query_logs:'📋', inspect_metrics:'📊', run_security_scan:'🔍',
-  restart_service:'🔄', scale_service:'⚖️', block_ip:'🚫',
-  rollback_deployment:'⏪', isolate_service:'🔒', submit_diagnosis:'🎯',
-  inject_noise:'🌫️', amplify_attack:'⚡', corrupt_metric:'💉',
-  create_false_alert:'🚨', accelerate_spread:'🦠',
+  query_logs:'LOG', inspect_metrics:'MET', run_security_scan:'SCAN',
+  restart_service:'RST', scale_service:'SCL', block_ip:'BLK',
+  rollback_deployment:'RBK', isolate_service:'ISO', submit_diagnosis:'SUB',
+  inject_noise:'NOISE', amplify_attack:'AMP', corrupt_metric:'CORR',
+  create_false_alert:'ALERT', accelerate_spread:'SPREAD',
 };
 
 // ═══════════════════════════════════════════════════════
@@ -1896,8 +2024,8 @@ function initBattleChart() {
     data: {
       labels: [],
       datasets: [
-        { label: '🔵 Defender', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
-        { label: '🔴 Attacker', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
+        { label: 'Defender', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
+        { label: 'Attacker', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
       ],
     },
     options: {
@@ -1950,7 +2078,7 @@ function setMode(m) {
 
 function resetUI() {
   if (sse) { sse.close(); sse = null; }
-  document.getElementById('actionFeed').innerHTML = '<div class="empty-state">🤖 The agent will appear here<br>as it investigates the incident.</div>';
+  document.getElementById('actionFeed').innerHTML = '<div class="empty-state">Agent actions appear here<br>during incident analysis.</div>';
   document.getElementById('logStream').innerHTML  = '<div class="log-line log-info">// System logs will stream here...</div>';
   document.getElementById('leftPanel').innerHTML  = '<div class="empty-state">Select a scenario and click<br><strong>Run Episode</strong> to start.</div>';
   document.getElementById('scoreTotal').textContent    = '—';
@@ -1996,7 +2124,7 @@ function renderSystemState(obs, taskId, panelId) {
       const cls = isRed ? 'alert-critical alert-red-injected' : (a.severity === 'critical' ? 'alert-critical' : a.severity === 'warning' ? 'alert-warning' : 'alert-info');
       html += `<div class="alert-item ${cls}">
         <div>
-          <div class="alert-sev">${isRed ? '[🔴 ATTACKER]' : '[' + (a.severity||'info').toUpperCase() + ']'}</div>
+          <div class="alert-sev">${isRed ? '[ATTACKER]' : '[' + (a.severity||'info').toUpperCase() + ']'}</div>
           <div class="alert-msg"><span class="alert-svc">${a.service}</span> · ${a.message || a.type}</div>
         </div></div>`;
     });
@@ -2048,11 +2176,11 @@ function appendActionCard(feedId, step, agentType, actionType, params, reward, r
   const rSign = r > 0 ? '+' : '';
   const aClass = isRed ? 'type-red-attack' : (ACTION_CLASS[actionType] || 'type-investigation');
   const cardClass = isRed ? 'red-card' : (r > 0 ? 'blue-card positive' : r < 0 ? 'blue-card negative' : 'blue-card neutral');
-  const icon = ACTION_ICON[actionType] || '⚙️';
+  const icon = ACTION_ICON[actionType] || 'ACT';
   const paramsStr = params && Object.keys(params).length ? Object.entries(params).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ') : 'auto';
   const agentLabel = isRed
-    ? '<span class="agent-label agent-red">🔴 Attacker</span>'
-    : '<span class="agent-label agent-blue">🔵 Defender</span>';
+    ? '<span class="agent-label agent-red">Attacker</span>'
+    : '<span class="agent-label agent-blue">Defender</span>';
 
   const card = document.createElement('div');
   card.className = `action-card ${cardClass}`;
@@ -2179,7 +2307,7 @@ function startDemo() {
 
     if (data.type === 'reset') {
       renderSystemState(data.observation, data.task_id, 'leftPanel');
-      showThinking('actionFeed', '🤖 Agent');
+      showThinking('actionFeed', 'Agent');
     }
     else if (data.type === 'step') {
       hideThinking();
@@ -2189,7 +2317,7 @@ function startDemo() {
       renderSystemState(data.observation, currentTask, 'leftPanel');
       updateChart(data.rewards_history, data.cumulative_reward);
       updateScores(data);
-      if (!data.done) showThinking('actionFeed', '🤖 Agent');
+      if (!data.done) showThinking('actionFeed', 'Agent');
     }
     else if (data.type === 'grade') {
       hideThinking();
@@ -2207,7 +2335,7 @@ function startDemo() {
       const correct = data.diagnosis_correct > 0.9;
       setTimeout(() => showEpisodeEnd(
         data.score,
-        correct ? '🏆' : data.score > 0.5 ? '✅' : '⚠️',
+        correct ? 'High' : data.score > 0.5 ? 'Partial' : 'Low',
         correct ? 'Incident Resolved!' : data.score > 0.5 ? 'Partially Resolved' : 'Episode Failed',
         data.score > 0.7 ? 'var(--green)' : data.score > 0.4 ? 'var(--yellow)' : 'var(--red)'
       ), 800);
@@ -2241,10 +2369,10 @@ function showToast(msg, duration = 4000) {
 
 async function showComparison() {
   if (Object.keys(comparisonScores).length < 2) {
-    showToast('Run both "Trained AI" and "Untrained" modes first, then click Compare!');
+    showToast('Run both model modes first, then click Compare.');
     return;
   }
-  document.getElementById('endIcon').textContent  = '⇄';
+  document.getElementById('endIcon').textContent  = 'Compare';
   document.getElementById('endTitle').textContent = 'Trained vs Untrained Agent';
   const diff = (comparisonScores.trained || 0) - (comparisonScores.untrained || 0);
   const scoreEl = document.getElementById('endScore');
@@ -2263,9 +2391,9 @@ async function showComparison() {
 // ═══════════════════════════════════════════════════════
 function resetBattle() {
   if (battleSse) { battleSse.close(); battleSse = null; }
-  document.getElementById('battleFeed').innerHTML = '<div class="empty-state">🔴 Attacker vs 🔵 Defender<br>will stream here in real-time.</div>';
+  document.getElementById('battleFeed').innerHTML = '<div class="empty-state">Attacker and defender actions<br>stream here in real time.</div>';
   document.getElementById('battleLogStream').innerHTML = '<div class="log-line log-info">// Combat logs will appear here...</div>';
-  document.getElementById('battleLeftPanel').innerHTML = '<div class="empty-state">Click <strong>⚔️ Start Battle</strong><br>to launch the live battle.</div>';
+  document.getElementById('battleLeftPanel').innerHTML = '<div class="empty-state">Click <strong>Start Battle</strong><br>to launch live simulation.</div>';
   document.getElementById('blueScore').textContent = '0.00';
   document.getElementById('redScore').textContent  = '0.00';
   document.getElementById('battleFinalScore').textContent = '—';
@@ -2299,7 +2427,7 @@ function startBattle() {
 
     if (data.type === 'battle_reset') {
       renderSystemState(data.observation, taskId, 'battleLeftPanel');
-      showThinking('battleFeed', '⚔️ Battle');
+      showThinking('battleFeed', 'Battle Engine');
     }
 
     else if (data.type === 'red_step') {
@@ -2308,12 +2436,12 @@ function startBattle() {
       redCum = data.red_cumulative;
       if (data.reward > 0) redRewardsHist.push(data.reward);
       appendActionCard('battleFeed', data.round, 'red', data.action, {}, data.reward, data.message, true);
-      appendLogs('battleLogStream', [`🔴 [ATTACKER] ${data.message}`], true);
+      appendLogs('battleLogStream', [`[ATTACKER] ${data.message}`], true);
       renderSystemState(data.observation, taskId, 'battleLeftPanel');
       document.getElementById('redScore').textContent = redCum.toFixed(2);
       if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
       updateBattleBars(blueCum, redCum, data.round);
-      showThinking('battleFeed', '🔵 Defender');
+      showThinking('battleFeed', 'Defender');
     }
 
     else if (data.type === 'blue_step') {
@@ -2327,7 +2455,7 @@ function startBattle() {
       document.getElementById('blueScore').textContent = blueCum.toFixed(2);
       if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
       updateBattleBars(blueCum, redCum, data.round);
-      showThinking('battleFeed', '🔴 Attacker');
+      showThinking('battleFeed', 'Attacker');
     }
 
     else if (data.type === 'battle_end') {
@@ -2350,11 +2478,11 @@ function startBattle() {
       document.getElementById('endBlueScore').textContent = data.blue_cumulative.toFixed(2);
       document.getElementById('endRedScore').textContent  = data.red_cumulative.toFixed(2);
       document.getElementById('endWinnerLabel').innerHTML = winner === 'defender'
-        ? '<div class="winner-label winner-blue">🔵 Defender Wins!</div>'
-        : '<div class="winner-label winner-red">🔴 Attacker Wins!</div>';
+        ? '<div class="winner-label winner-blue">Defender Wins</div>'
+        : '<div class="winner-label winner-red">Attacker Wins</div>';
       setTimeout(() => showEpisodeEnd(
         data.score,
-        winner === 'defender' ? '🛡️' : '💀',
+        winner === 'defender' ? 'Defender' : 'Attacker',
         winner === 'defender' ? 'Defender Wins!' : 'Attacker Wins!',
         winner === 'defender' ? 'var(--blue-bright)' : 'var(--red-bright)'
       ), 800);
@@ -2426,7 +2554,7 @@ function renderCurriculum(d) {
   if (d.level_up_history.length > 0) {
     html += `<div class="section-title" style="margin-top:12px">Level-Up History</div>`;
     d.level_up_history.forEach(lu => {
-      html += `<div class="level-up-event">⬆️ Ep ${lu.episode}: Level ${lu.from_level} → ${lu.to_level} (avg ${lu.avg_score.toFixed(3)})</div>`;
+      html += `<div class="level-up-event">Episode ${lu.episode}: Level ${lu.from_level} -> ${lu.to_level} (avg ${lu.avg_score.toFixed(3)})</div>`;
     });
   }
 
@@ -2439,7 +2567,7 @@ function renderCurriculum(d) {
   } else {
     luEl.innerHTML = d.level_up_history.map(lu =>
       `<div class="level-up-event" style="margin-bottom:5px">
-        ⬆️ Episode ${lu.episode}: <strong>Level ${lu.from_level} → ${lu.to_level}</strong>
+        Episode ${lu.episode}: <strong>Level ${lu.from_level} -> ${lu.to_level}</strong>
         &nbsp;·&nbsp; avg score <strong>${lu.avg_score.toFixed(3)}</strong>
       </div>`
     ).join('');
