@@ -12,8 +12,17 @@ POST /grade          – grade the current episode
 GET  /health         – liveness probe
 GET  /tasks          – list available tasks
 GET  /web            – simple debug UI
-GET  /dashboard      – 🔥 Live AI Demo Dashboard
-GET  /demo/stream    – SSE stream: run a full episode step-by-step (for dashboard)
+GET  /dashboard      – 🔥 Live AI Demo Dashboard  (Attacker vs Defender)
+GET  /demo/stream    – SSE stream: single-agent episode (for basic demo)
+GET  /battle/stream  – SSE stream: Red Attacker vs Blue Defender live battle
+
+Multi-Agent Architecture
+------------------------
+- Red Agent  (Attacker)  – escalates the incident, tries to worsen metrics
+- Blue Agent (Defender)  – investigates and mitigates the incident
+- Both share the same environment; turn order is interleaved
+- Each agent has a distinct reward signal (zero-sum-like)
+- Curriculum: Blue agent auto-levels up as it solves harder tasks
 
 Session model
 -------------
@@ -25,8 +34,11 @@ to run different tasks without colliding.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import random
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -53,6 +65,324 @@ def _get_session(session_id: str) -> OpenSecOpsEnv:
             detail=f"Session '{session_id}' not found. Call /reset first.",
         )
     return _sessions[session_id]
+
+
+# ---------------------------------------------------------------------------
+# ██████╗ ███████╗██████╗     ███████╗███████╗ ██████╗ ███████╗███████╗
+# ██╔══██╗██╔════╝██╔══██╗    ██╔════╝██╔════╝██╔════╝ ██╔════╝██╔════╝
+# ██████╔╝█████╗  ██║  ██║    ███████╗█████╗  ██║  ███╗█████╗  ███████╗
+# ██╔══██╗██╔══╝  ██║  ██║    ╚════██║██╔══╝  ██║   ██║██╔══╝  ╚════██║
+# ██║  ██║███████╗██████╔╝    ███████║███████╗╚██████╔╝███████╗███████║
+# Multi-Agent:  Red (Attacker)  vs  Blue (Defender)
+# ---------------------------------------------------------------------------
+
+# Red agent actions: escalate attacks, confuse defender, corrupt metrics
+RED_ACTIONS = [
+    "inject_noise",       # inject misleading log noise
+    "amplify_attack",     # boost attack_progress
+    "corrupt_metric",     # spike a random healthy service's cpu/latency
+    "create_false_alert", # add a misleading critical alert
+    "accelerate_spread",  # spread attack to adjacent service
+]
+
+
+@dataclass
+class RedAgentState:
+    """Lightweight internal state for the Red agent."""
+    task_id: str = ""
+    round: int = 0
+    actions_taken: list[str] = field(default_factory=list)
+    total_damage: float = 0.0
+
+
+class MultiAgentSecOpsEnv:
+    """
+    Wraps OpenSecOpsEnv to expose separate blue_step() and red_step() interfaces.
+
+    Blue Agent (Defender): uses the standard SecOpsAction API.
+    Red  Agent (Attacker): uses RedAgent heuristics to make the incident worse.
+
+    Turn order: red acts first each round (escalate), then blue responds (mitigate).
+    This models real adversarial incident response.
+    """
+
+    def __init__(self) -> None:
+        self._env = OpenSecOpsEnv()
+        self._red_state = RedAgentState()
+        self._rng = random.Random(42)
+        self._cumulative_blue_reward = 0.0
+        self._cumulative_red_reward = 0.0
+
+    def reset(self, task_id: str) -> dict[str, Any]:
+        obs = self._env.reset(task_id)
+        self._red_state = RedAgentState(task_id=task_id)
+        self._cumulative_blue_reward = 0.0
+        self._cumulative_red_reward = 0.0
+        return self._build_ma_state(obs)
+
+    # --- Blue (Defender) step ---
+    def blue_step(
+        self, action: SecOpsAction
+    ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
+        obs, reward, done, info = self._env.step(action)
+        self._cumulative_blue_reward += reward
+        info["blue_cumulative"] = round(self._cumulative_blue_reward, 4)
+        info["red_cumulative"] = round(self._cumulative_red_reward, 4)
+        return self._build_ma_state(obs), reward, done, info
+
+    # --- Red (Attacker) step ---
+    def red_step(
+        self, action_type: Optional[str] = None
+    ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
+        """
+        Heuristic Red Agent step.  Reward is the negative of what the Blue
+        agent would gain — i.e., Red benefits when the environment is harder
+        to diagnose and recover from.
+        """
+        self._red_state.round += 1
+        red_reward = 0.0
+        message = ""
+
+        env = self._env
+        hidden = env._hidden
+        metrics = env._metrics
+
+        # Choose action heuristically if not specified
+        if action_type is None or action_type == "auto":
+            action_type = self._heuristic_red_action()
+
+        self._red_state.actions_taken.append(action_type)
+
+        if action_type == "inject_noise":
+            # Add misleading log entries to obscure the real issue
+            env._task_cfg.setdefault("initial_logs", [])
+            noise_logs = [
+                "[cache] WARN  Memory spike (harmless GC event) detected",
+                "[db]   INFO  Routine VACUUM running – may spike CPU temporarily",
+                "[auth] INFO  Token rotation in progress – latency may increase",
+                "[api]  WARN  Connection pool resize – client may see 503 briefly",
+            ]
+            entry = self._rng.choice(noise_logs)
+            env._task_cfg["initial_logs"].append(entry)
+            red_reward = 0.1
+            message = f"Red injected misleading log: {entry[:60]}..."
+
+        elif action_type == "amplify_attack":
+            if hidden.true_root_cause == "cyber_attack":
+                boost = self._rng.uniform(0.05, 0.15)
+                hidden.attack_progress = min(1.0, hidden.attack_progress + boost)
+                red_reward = 0.2
+                message = f"Red amplified attack progress by {boost:.2f} → {hidden.attack_progress:.2f}"
+            else:
+                red_reward = 0.0
+                message = "Red tried to amplify — no active attack to boost."
+
+        elif action_type == "corrupt_metric":
+            # Spike a *healthy* (non-affected) service to mislead the defender
+            healthy = [
+                s for s in metrics
+                if s not in hidden.affected_services
+            ]
+            if healthy:
+                svc = self._rng.choice(healthy)
+                metrics[svc].cpu = min(100.0, metrics[svc].cpu + self._rng.uniform(20, 40))
+                metrics[svc].latency = min(5000.0, metrics[svc].latency + self._rng.uniform(150, 400))
+                red_reward = 0.15
+                message = f"Red spiked metrics on healthy service '{svc}' to create false alarm."
+            else:
+                red_reward = 0.0
+                message = "Red tried to corrupt metrics — no healthy services available."
+
+        elif action_type == "create_false_alert":
+            healthy = [s for s in metrics if s not in hidden.affected_services]
+            if healthy:
+                svc = self._rng.choice(healthy)
+                false_alert = {
+                    "service": svc,
+                    "type": self._rng.choice(["high_cpu", "high_memory", "high_latency"]),
+                    "severity": "critical",
+                    "message": f"[RED INJECTED] {svc} critical threshold exceeded",
+                    "_red_injected": True,
+                }
+                env._task_cfg.setdefault("initial_alerts", []).append(false_alert)
+                red_reward = 0.15
+                message = f"Red injected a false CRITICAL alert on '{svc}'."
+            else:
+                red_reward = 0.0
+                message = "No healthy services to inject false alert on."
+
+        elif action_type == "accelerate_spread":
+            # Try to spread the attack to an adjacent service
+            topology = env._task_cfg.get("topology", {})
+            new_victims = set()
+            for affected in list(hidden.affected_services):
+                for neighbor in topology.get(affected, []):
+                    if neighbor not in hidden.affected_services:
+                        new_victims.add(neighbor)
+            if new_victims:
+                new_svc = self._rng.choice(list(new_victims))
+                hidden.affected_services.append(new_svc)
+                metrics[new_svc].cpu = min(100.0, metrics[new_svc].cpu + 25.0)
+                metrics[new_svc].error_rate = min(100.0, metrics[new_svc].error_rate + 8.0)
+                red_reward = 0.25
+                message = f"Red spread attack to new service '{new_svc}'!"
+            else:
+                red_reward = 0.05
+                message = "Red tried to spread — no adjacent services to infect."
+
+        else:
+            message = f"Unknown red action '{action_type}'"
+            red_reward = 0.0
+
+        self._cumulative_red_reward += red_reward
+        self._red_state.total_damage += red_reward
+
+        done = env._state.done
+        obs = env._build_observation(f"[ATTACKER] {message}")
+
+        info = {
+            "red_action": action_type,
+            "red_reward": round(red_reward, 4),
+            "red_cumulative": round(self._cumulative_red_reward, 4),
+            "blue_cumulative": round(self._cumulative_blue_reward, 4),
+            "message": message,
+        }
+
+        return self._build_ma_state(obs), red_reward, done, info
+
+    def _heuristic_red_action(self) -> str:
+        """Smart heuristic: Red agent picks best available action."""
+        hidden = self._env._hidden
+        metrics = self._env._metrics
+
+        # Prefer amplify if there's an active attack
+        if hidden.true_root_cause == "cyber_attack" and hidden.attack_progress < 0.8:
+            return "amplify_attack"
+
+        # If many healthy services exist, try to spread or corrupt
+        healthy = [s for s in metrics if s not in hidden.affected_services]
+        if healthy and self._rng.random() < 0.4:
+            return "corrupt_metric"
+        if hidden.true_root_cause == "cyber_attack" and self._rng.random() < 0.3:
+            return "accelerate_spread"
+
+        # Default: inject noise to confuse
+        return "inject_noise"
+
+    def _build_ma_state(self, obs) -> dict[str, Any]:
+        state = self._env.state.to_dict()
+        state["multi_agent"] = {
+            "red_round": self._red_state.round,
+            "red_actions": self._red_state.actions_taken,
+            "red_total_damage": round(self._red_state.total_damage, 4),
+            "blue_cumulative_reward": round(self._cumulative_blue_reward, 4),
+            "red_cumulative_reward": round(self._cumulative_red_reward, 4),
+        }
+        state["observation"] = {
+            "alerts": obs.alerts,
+            "metrics": obs.metrics,
+            "logs": obs.logs,
+            "topology": obs.topology,
+            "last_action_result": obs.last_action_result,
+            "time_step": obs.time_step,
+        }
+        return state
+
+    @property
+    def state(self) -> dict[str, Any]:
+        obs = self._env._build_observation("state_query")
+        return self._build_ma_state(obs)
+
+
+# ---------------------------------------------------------------------------
+# Curriculum  — tracks Blue agent improvement across episodes
+# ---------------------------------------------------------------------------
+
+CURRICULUM_LEVELS = [
+    {"level": 1, "tasks": ["easy_memory_leak"],                        "threshold": 0.65},
+    {"level": 2, "tasks": ["easy_memory_leak", "medium_ddos_cascade"], "threshold": 0.70},
+    {"level": 3, "tasks": ["medium_ddos_cascade", "medium_hard_bad_deployment"], "threshold": 0.72},
+    {"level": 4, "tasks": ["medium_hard_bad_deployment", "hard_data_exfiltration"], "threshold": 0.75},
+    {"level": 5, "tasks": ["hard_data_exfiltration"],                  "threshold": 0.80},
+]
+
+
+class CurriculumManager:
+    """
+    Self-Improvement loop:
+    - Blue agent starts at level 1 (easy tasks)
+    - When average score over last N episodes exceeds threshold → level up
+    - Reward curves, improvements, and level transitions are logged
+    """
+
+    def __init__(self) -> None:
+        self.current_level: int = 1
+        self.episode_count: int = 0
+        self.score_history: list[dict[str, Any]] = []
+        self.level_up_history: list[dict[str, Any]] = []
+        self._rng = random.Random(0)
+        self._window = 5  # rolling window for level-up check
+
+    def get_next_task(self) -> dict[str, Any]:
+        lvl_cfg = CURRICULUM_LEVELS[min(self.current_level - 1, len(CURRICULUM_LEVELS) - 1)]
+        task_id = self._rng.choice(lvl_cfg["tasks"])
+        return TASKS[task_id]
+
+    def record_score(self, task_id: str, score: float) -> None:
+        self.episode_count += 1
+        self.score_history.append({
+            "episode": self.episode_count,
+            "task_id": task_id,
+            "score": round(score, 4),
+            "level": self.current_level,
+        })
+        self._maybe_level_up()
+
+    def _maybe_level_up(self) -> None:
+        if self.current_level >= len(CURRICULUM_LEVELS):
+            return
+        lvl_cfg = CURRICULUM_LEVELS[self.current_level - 1]
+        window = [r["score"] for r in self.score_history[-self._window:]]
+        if len(window) < self._window:
+            return
+        avg = sum(window) / len(window)
+        if avg >= lvl_cfg["threshold"]:
+            old_level = self.current_level
+            self.current_level += 1
+            self.level_up_history.append({
+                "from_level": old_level,
+                "to_level": self.current_level,
+                "episode": self.episode_count,
+                "avg_score": round(avg, 4),
+            })
+
+    def summary(self) -> str:
+        if not self.score_history:
+            return "No episodes recorded yet."
+        recent = self.score_history[-10:]
+        avg = sum(r["score"] for r in recent) / len(recent)
+        return (
+            f"Level {self.current_level}/{len(CURRICULUM_LEVELS)} | "
+            f"{self.episode_count} episodes | "
+            f"Recent avg score: {avg:.3f} | "
+            f"Level-ups: {len(self.level_up_history)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Global multi-agent state
+# ---------------------------------------------------------------------------
+_ma_sessions: dict[str, MultiAgentSecOpsEnv] = {}
+_curriculum = CurriculumManager()
+
+
+def _get_ma_session(session_id: str) -> MultiAgentSecOpsEnv:
+    if session_id not in _ma_sessions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Multi-agent session '{session_id}' not found. Call /multi/reset first.",
+        )
+    return _ma_sessions[session_id]
 
 
 # ---------------------------------------------------------------------------
@@ -93,16 +423,19 @@ class MultiAgentResetRequest(BaseModel):
     task_id: str | None = None
     session_id: str = "default_ma"
 
+
 class RedActionRequest(BaseModel):
     action_type: str | None = None
     parameters: dict[str, Any] = {}
     session_id: str = "default_ma"
+
 
 class MultiAgentStepResponse(BaseModel):
     observation: dict[str, Any]
     reward: float
     done: bool
     info: dict[str, Any] = {}
+
 
 class CurriculumSummaryResponse(BaseModel):
     current_level: int
@@ -115,13 +448,15 @@ class CurriculumSummaryResponse(BaseModel):
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="OpenSecOpsEnv",
+    title="OpenSecOpsEnv — Attacker vs Defender",
     description=(
         "SecOps incident response environment for RL agent evaluation. "
         "Simulates memory leaks, DDoS attacks, misconfiguration, and "
-        "data exfiltration scenarios across 4 tasks of increasing difficulty."
+        "data exfiltration scenarios across 4 tasks of increasing difficulty. "
+        "Features a live Red (Attacker) vs Blue (Defender) multi-agent battle "
+        "with self-improving curriculum learning."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -135,7 +470,7 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe."""
-    return {"status": "ok", "environment": "opensecops", "version": "0.3.0"}
+    return {"status": "ok", "environment": "opensecops", "version": "0.4.0"}
 
 
 @app.get("/tasks")
@@ -243,64 +578,70 @@ def grade_episode(session_id: str = "") -> GradeResponse:
 
 @app.post("/multi/reset", response_model=StateResponse)
 def multi_reset(req: MultiAgentResetRequest) -> StateResponse:
+    """Reset a multi-agent (Attacker vs Defender) session."""
     sid = req.session_id
-    if sid not in _ma_sessions:
-        _ma_sessions[sid] = MultiAgentSecOpsEnv()
-    
+    _ma_sessions[sid] = MultiAgentSecOpsEnv()
     env = _ma_sessions[sid]
+
     # If task_id is "auto", curriculum decides the next task
     if req.task_id == "auto":
         task_cfg = _curriculum.get_next_task()
         tid = task_cfg["task_id"]
-        # Temporary registration if it's a generated task
-        if tid not in TASKS:
-            TASKS[tid] = task_cfg
     else:
         tid = req.task_id or "hard_data_exfiltration"
-        
-    env.reset(tid)
-    return StateResponse(state=env.state)
+
+    state_dict = env.reset(tid)
+    return StateResponse(state=state_dict)
+
 
 @app.post("/multi/blue/step", response_model=MultiAgentStepResponse)
 def multi_blue_step(req: StepRequest) -> MultiAgentStepResponse:
+    """Blue (Defender) agent step — investigate and mitigate."""
     env = _get_ma_session(req.session_id)
     action = SecOpsAction(
         action_type=req.action_type,
         parameters=req.parameters,
     )
-    obs, reward, done, info = env.blue_step(action)
-    
+    obs_dict, reward, done, info = env.blue_step(action)
+
     if done:
-        # Record final score in curriculum
-        g = grade(env.state)
-        _curriculum.record_score(env._ma_state.task_id, g.score)
-        
+        # Record final score in curriculum for self-improvement
+        g = grade(env._env.state.to_dict())
+        _curriculum.record_score(env._red_state.task_id, g.score)
+
     return MultiAgentStepResponse(
-        observation=obs.to_dict(),
+        observation=obs_dict,
         reward=reward,
         done=done,
         info=info,
     )
 
+
 @app.post("/multi/red/step", response_model=MultiAgentStepResponse)
 def multi_red_step(req: RedActionRequest) -> MultiAgentStepResponse:
+    """Red (Attacker) agent step — escalate / confuse / spread."""
     env = _get_ma_session(req.session_id)
-    
-    # If action_type is missing or auto, use heuristic Red agent
-    action = None
+
+    # Use specified action or let heuristic agent decide
+    action_type = None
     if req.action_type and req.action_type != "auto":
-        action = RedAction(
-            action_type=req.action_type,
-            parameters=req.parameters,
-        )
-        
-    obs, reward, done, info = env.red_step(action)
+        action_type = req.action_type
+
+    obs_dict, reward, done, info = env.red_step(action_type)
     return MultiAgentStepResponse(
-        observation=obs,  # red's limited view
+        observation=obs_dict,
         reward=reward,
         done=done,
         info=info,
     )
+
+
+@app.get("/multi/state")
+def multi_state(session_id: str = "default_ma") -> StateResponse:
+    """Get the current multi-agent session state."""
+    env = _get_ma_session(session_id)
+    return StateResponse(state=env.state)
+
 
 # ---------------------------------------------------------------------------
 # Curriculum Endpoints
@@ -308,6 +649,7 @@ def multi_red_step(req: RedActionRequest) -> MultiAgentStepResponse:
 
 @app.get("/curriculum/summary", response_model=CurriculumSummaryResponse)
 def curriculum_summary() -> CurriculumSummaryResponse:
+    """Return cursor on the Blue agent's self-improvement journey."""
     return CurriculumSummaryResponse(
         current_level=_curriculum.current_level,
         total_episodes=_curriculum.episode_count,
@@ -317,10 +659,10 @@ def curriculum_summary() -> CurriculumSummaryResponse:
 
 
 # ---------------------------------------------------------------------------
-# SSE Demo Stream  — powers the live dashboard
+# SSE Demo Stream  — powers the live dashboard (single-agent)
 # ---------------------------------------------------------------------------
 
-# Heuristic playbooks (deterministic, perfect agent)
+# Heuristic playbooks (deterministic, expert agent)
 _HEURISTIC_PLAYBOOKS: dict[str, list[dict]] = {
     "easy_memory_leak": [
         {"action_type": "inspect_metrics",  "parameters": {}},
@@ -391,6 +733,14 @@ _BAD_AGENT_PLAYBOOKS: dict[str, list[dict]] = {
     ],
 }
 
+# Red (Attacker) heuristic playbook — interleaved with blue steps
+_RED_PLAYBOOK_BY_TASK: dict[str, list[str]] = {
+    "easy_memory_leak":           ["inject_noise", "corrupt_metric", "inject_noise"],
+    "medium_ddos_cascade":        ["amplify_attack", "create_false_alert", "amplify_attack", "inject_noise"],
+    "medium_hard_bad_deployment": ["inject_noise", "corrupt_metric", "create_false_alert", "inject_noise"],
+    "hard_data_exfiltration":     ["amplify_attack", "accelerate_spread", "create_false_alert", "amplify_attack", "inject_noise"],
+}
+
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
@@ -403,7 +753,7 @@ async def demo_stream(
     speed: float = 1.5,      # seconds between steps
 ):
     """
-    Server-Sent Events stream of a full episode.
+    Server-Sent Events stream of a full single-agent episode.
     Powers the live dashboard. mode=trained uses expert agent,
     mode=untrained uses the bad agent to show contrast.
     """
@@ -495,13 +845,147 @@ async def demo_stream(
     )
 
 
+@app.get("/battle/stream")
+async def battle_stream(
+    task_id: str = "hard_data_exfiltration",
+    speed: float = 1.5,
+):
+    """
+    🔴 vs 🔵  Attacker vs Defender live battle SSE stream.
+    Interleaves Red (Attacker) and Blue (Defender) turns.
+    Powers the multi-agent panel in the dashboard.
+    """
+    async def event_gen():
+        try:
+            ma_env = MultiAgentSecOpsEnv()
+            state_dict = ma_env.reset(task_id)
+            obs = state_dict["observation"]
+
+            yield _sse({
+                "type": "battle_reset",
+                "task_id": task_id,
+                "observation": obs,
+                "multi_agent": state_dict.get("multi_agent", {}),
+            })
+
+            blue_playbook = copy.deepcopy(
+                _HEURISTIC_PLAYBOOKS.get(task_id, _HEURISTIC_PLAYBOOKS["hard_data_exfiltration"])
+            )
+            red_actions = _RED_PLAYBOOK_BY_TASK.get(task_id, ["inject_noise", "amplify_attack", "corrupt_metric"])
+
+            blue_rewards: list[float] = []
+            red_rewards: list[float] = []
+            blue_cum = 0.0
+            red_cum = 0.0
+            done = False
+            round_num = 0
+
+            max_rounds = max(len(blue_playbook), len(red_actions)) + 2
+
+            for round_num in range(max_rounds):
+                if done:
+                    break
+
+                # — Red turn (Attacker escalates) —
+                red_action_type = (
+                    red_actions[round_num % len(red_actions)]
+                    if red_actions else "inject_noise"
+                )
+                await asyncio.sleep(max(0.3, speed * 0.4))
+
+                red_state, red_r, done, red_info = ma_env.red_step(red_action_type)
+                red_cum += red_r
+                red_rewards.append(round(red_r, 4))
+
+                yield _sse({
+                    "type": "red_step",
+                    "round": round_num + 1,
+                    "action": red_action_type,
+                    "reward": round(red_r, 4),
+                    "red_cumulative": round(red_cum, 4),
+                    "blue_cumulative": round(blue_cum, 4),
+                    "message": red_info.get("message", ""),
+                    "observation": red_state.get("observation", {}),
+                    "multi_agent": red_state.get("multi_agent", {}),
+                    "red_rewards": red_rewards,
+                    "blue_rewards": blue_rewards,
+                })
+
+                if done:
+                    break
+
+                # — Blue turn (Defender responds) —
+                if round_num < len(blue_playbook):
+                    blue_action_dict = blue_playbook[round_num]
+                else:
+                    break
+
+                await asyncio.sleep(max(0.5, speed * 0.6))
+
+                action = SecOpsAction(
+                    action_type=blue_action_dict["action_type"],
+                    parameters=blue_action_dict.get("parameters", {}),
+                )
+                blue_state, blue_r, done, blue_info = ma_env.blue_step(action)
+                blue_cum += blue_r
+                blue_rewards.append(round(blue_r, 4))
+
+                yield _sse({
+                    "type": "blue_step",
+                    "round": round_num + 1,
+                    "action": blue_action_dict["action_type"],
+                    "parameters": blue_action_dict.get("parameters", {}),
+                    "reward": round(blue_r, 4),
+                    "blue_cumulative": round(blue_cum, 4),
+                    "red_cumulative": round(red_cum, 4),
+                    "result": blue_state.get("observation", {}).get("last_action_result", ""),
+                    "observation": blue_state.get("observation", {}),
+                    "multi_agent": blue_state.get("multi_agent", {}),
+                    "red_rewards": red_rewards,
+                    "blue_rewards": blue_rewards,
+                })
+
+                if done:
+                    break
+
+            # Final grade
+            await asyncio.sleep(0.5)
+            result = grade(ma_env._env.state.to_dict())
+            winner = "defender" if blue_cum > red_cum else "attacker"
+            yield _sse({
+                "type": "battle_end",
+                "score": round(result.score, 4),
+                "diagnosis_correct": result.diagnosis_correct,
+                "action_efficiency": round(result.action_efficiency, 4),
+                "investigation_quality": round(result.investigation_quality, 4),
+                "blue_cumulative": round(blue_cum, 4),
+                "red_cumulative": round(red_cum, 4),
+                "winner": winner,
+                "blue_rewards": blue_rewards,
+                "red_rewards": red_rewards,
+                "details": result.details,
+            })
+
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dashboard (served at /dashboard)
 # ---------------------------------------------------------------------------
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
-    """Live AI Demo Dashboard — the main judge-facing demo."""
+    """Live AI Demo Dashboard — Attacker vs Defender + Self-Improvement."""
     return HTMLResponse(content=_DASHBOARD_HTML)
 
 
@@ -599,34 +1083,42 @@ async function doGrade() {
 
 
 # ---------------------------------------------------------------------------
-# Dashboard HTML (inline — no static files needed, works in Docker/HF Space)
+# Dashboard HTML — Attacker vs Defender + Self-Improvement Theme
 # ---------------------------------------------------------------------------
 _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenSecOpsEnv — Live AI Demo</title>
+<title>OpenSecOpsEnv — Attacker vs Defender</title>
+<meta name="description" content="Live AI Demo: Red Attacker vs Blue Defender agent battle with self-improving curriculum learning. OpenEnv Hackathon submission.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #f8fafc;
-    --bg2: #ffffff;
-    --bg3: #f1f5f9;
-    --border: #e2e8f0;
-    --border2: #cbd5e1;
-    --blue: #2563eb;
-    --green: #16a34a;
-    --red: #dc2626;
-    --orange: #d97706;
-    --yellow: #ca8a04;
-    --purple: #7c3aed;
-    --text: #0f172a;
-    --text2: #64748b;
-    --card-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
-    --card-shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.05);
+    --bg: #0a0f1e;
+    --bg2: #0d1426;
+    --bg3: #111827;
+    --bg4: #1a2235;
+    --border: #1e2d45;
+    --border2: #253347;
+    --blue: #3b82f6;
+    --blue-bright: #60a5fa;
+    --green: #10b981;
+    --red: #ef4444;
+    --red-bright: #f87171;
+    --orange: #f59e0b;
+    --yellow: #eab308;
+    --purple: #8b5cf6;
+    --cyan: #06b6d4;
+    --text: #e2e8f0;
+    --text2: #94a3b8;
+    --text3: #64748b;
+    --card-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    --glow-blue: 0 0 20px rgba(59,130,246,0.15);
+    --glow-red: 0 0 20px rgba(239,68,68,0.15);
+    --glow-green: 0 0 20px rgba(16,185,129,0.15);
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -639,73 +1131,92 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     overflow-x: hidden;
   }
 
-  .app { position: relative; }
-
   /* ---- Header ---- */
   .header {
     border-bottom: 1px solid var(--border);
-    padding: 12px 24px;
+    padding: 10px 20px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: #ffffff;
+    background: var(--bg2);
     position: sticky;
     top: 0;
     z-index: 100;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    backdrop-filter: blur(12px);
   }
-  .header-left { display: flex; align-items: center; gap: 14px; }
-  .logo { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600; color: var(--blue); }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600;
+    color: var(--blue-bright); letter-spacing: -0.02em;
+  }
   .logo span { color: var(--text2); font-weight: 400; }
   .badge {
-    font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+    font-size: 9px; font-weight: 700; letter-spacing: 0.1em;
     padding: 3px 8px; border-radius: 4px; text-transform: uppercase;
   }
-  .badge-openenv { background: #eff6ff; color: var(--blue); border: 1px solid #bfdbfe; }
-  .badge-live { background: #fef2f2; color: var(--red); border: 1px solid #fecaca; animation: pulse-badge 2s infinite; }
-  @keyframes pulse-badge { 0%,100%{opacity:1} 50%{opacity:0.6} }
-  .header-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text2); }
-  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); animation: pulse-dot 2s infinite; }
-  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  .badge-openenv { background: rgba(59,130,246,0.15); color: var(--blue-bright); border: 1px solid rgba(59,130,246,0.3); }
+  .badge-live { background: rgba(239,68,68,0.15); color: var(--red-bright); border: 1px solid rgba(239,68,68,0.3); animation: pulse-badge 1.5s infinite; }
+  @keyframes pulse-badge { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  .badge-self-improve { background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3); }
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .header-status { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text3); }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse-dot 2s infinite; }
+  @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+  /* ---- Tab bar ---- */
+  .tab-bar {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    padding: 0 20px;
+    gap: 4px;
+  }
+  .tab {
+    padding: 9px 18px; font-size: 12px; font-weight: 600;
+    color: var(--text3); cursor: pointer; border: none; background: none;
+    border-bottom: 2px solid transparent; transition: all 0.2s;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .tab:hover { color: var(--text2); }
+  .tab.active { color: var(--blue-bright); border-bottom-color: var(--blue-bright); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: flex; flex-direction: column; }
 
   /* ---- Controls bar ---- */
   .controls {
-    padding: 12px 24px;
+    padding: 10px 20px;
     display: flex;
     align-items: center;
     gap: 10px;
     border-bottom: 1px solid var(--border);
-    background: #ffffff;
+    background: var(--bg2);
     flex-wrap: wrap;
   }
   .control-group { display: flex; flex-direction: column; gap: 3px; }
-  .control-label { font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text2); }
+  .control-label { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); }
   select, .btn {
-    font-family: 'Inter', sans-serif;
-    font-size: 13px;
-    border-radius: 6px;
-    border: 1px solid var(--border2);
-    background: #ffffff;
-    color: var(--text);
-    padding: 7px 12px;
-    cursor: pointer;
-    outline: none;
-    transition: border-color 0.15s;
+    font-family: 'Inter', sans-serif; font-size: 12px;
+    border-radius: 6px; border: 1px solid var(--border2);
+    background: var(--bg3); color: var(--text);
+    padding: 6px 11px; cursor: pointer; outline: none;
+    transition: border-color 0.15s, background 0.15s;
   }
-  select:hover, select:focus { border-color: var(--blue); }
-  .btn { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  select:hover, select:focus { border-color: var(--blue); background: var(--bg4); }
+  .btn { font-weight: 600; display: flex; align-items: center; gap: 5px; }
   .btn-primary { background: var(--blue); color: #fff; border-color: var(--blue); }
-  .btn-primary:hover { background: #1d4ed8; }
-  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-ghost { background: transparent; color: var(--text2); }
-  .btn-ghost:hover { color: var(--text); border-color: var(--border2); background: var(--bg3); }
+  .btn-primary:hover { background: #2563eb; }
+  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn-red { background: rgba(239,68,68,0.2); color: var(--red-bright); border-color: rgba(239,68,68,0.3); }
+  .btn-red:hover { background: rgba(239,68,68,0.3); }
+  .btn-ghost { background: transparent; color: var(--text3); border-color: var(--border2); }
+  .btn-ghost:hover { color: var(--text2); border-color: var(--border); background: var(--bg4); }
   .mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid var(--border2); }
-  .mode-btn { padding: 7px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; background: #ffffff; color: var(--text2); border: none; }
-  .mode-btn.active-trained { background: #f0fdf4; color: var(--green); }
-  .mode-btn.active-untrained { background: #fef2f2; color: var(--red); }
+  .mode-btn { padding: 6px 13px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s; background: var(--bg3); color: var(--text3); border: none; }
+  .mode-btn.active-trained { background: rgba(16,185,129,0.15); color: var(--green); }
+  .mode-btn.active-untrained { background: rgba(239,68,68,0.15); color: var(--red-bright); }
 
   /* ---- Main layout ---- */
-  .main { display: grid; grid-template-columns: 340px 1fr 300px; gap: 0; height: calc(100vh - 120px); }
+  .main { display: grid; grid-template-columns: 300px 1fr 280px; height: calc(100vh - 104px); }
 
   /* ---- Panel base ---- */
   .panel {
@@ -716,141 +1227,144 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--bg);
   }
   .panel-header {
-    padding: 10px 16px;
+    padding: 9px 14px;
     border-bottom: 1px solid var(--border);
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text2);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text3);
+    display: flex; align-items: center; justify-content: space-between;
     flex-shrink: 0;
-    background: #ffffff;
+    background: var(--bg2);
   }
-  .panel-header-dot { width: 8px; height: 8px; border-radius: 50%; }
-  .panel-body { flex: 1; overflow-y: auto; padding: 14px; }
-  .panel-body::-webkit-scrollbar { width: 4px; }
+  .panel-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .panel-body { flex: 1; overflow-y: auto; padding: 12px; }
+  .panel-body::-webkit-scrollbar { width: 3px; }
   .panel-body::-webkit-scrollbar-track { background: transparent; }
   .panel-body::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
-  /* ---- Left Panel: Scenario + Metrics + Topology ---- */
+  /* ---- Scenario card ---- */
+  .scenario-card {
+    background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(139,92,246,0.08));
+    border: 1px solid rgba(59,130,246,0.2);
+    border-radius: 8px; padding: 11px; margin-bottom: 11px;
+  }
+  .scenario-name { font-size: 12px; font-weight: 600; color: var(--blue-bright); margin-bottom: 3px; }
+  .scenario-desc { font-size: 10px; color: var(--text3); line-height: 1.5; }
+  .difficulty-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 9px; font-weight: 700; border-radius: 4px; padding: 2px 7px; margin-top: 5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .diff-easy { background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
+  .diff-medium { background: rgba(234,179,8,0.15); color: var(--yellow); border: 1px solid rgba(234,179,8,0.3); }
+  .diff-medium_hard { background: rgba(245,158,11,0.15); color: var(--orange); border: 1px solid rgba(245,158,11,0.3); }
+  .diff-hard { background: rgba(239,68,68,0.15); color: var(--red-bright); border: 1px solid rgba(239,68,68,0.3); }
+
+  /* ---- Section title ---- */
   .section-title {
-    font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase;
-    color: var(--text2); margin-bottom: 8px; display: flex; align-items: center; gap: 6px;
+    font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--text3); margin-bottom: 7px; display: flex; align-items: center; gap: 6px;
   }
   .section-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
 
-  .scenario-card {
-    background: #eff6ff;
-    border: 1px solid #bfdbfe;
-    border-radius: 8px;
-    padding: 12px;
-    margin-bottom: 12px;
-  }
-  .scenario-name { font-size: 13px; font-weight: 600; color: var(--blue); margin-bottom: 4px; }
-  .scenario-desc { font-size: 11px; color: var(--text2); line-height: 1.5; }
-  .difficulty-badge {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; font-weight: 600; border-radius: 4px; padding: 2px 7px; margin-top: 6px;
-  }
-  .diff-easy { background: #f0fdf4; color: var(--green); border: 1px solid #bbf7d0; }
-  .diff-medium { background: #fefce8; color: var(--yellow); border: 1px solid #fef08a; }
-  .diff-medium_hard { background: #fff7ed; color: var(--orange); border: 1px solid #fed7aa; }
-  .diff-hard { background: #fef2f2; color: var(--red); border: 1px solid #fecaca; }
-
-  /* Metrics */
+  /* ---- Metrics ---- */
   .metric-row {
-    display: grid; grid-template-columns: 80px 1fr 45px;
-    align-items: center; gap: 8px; margin-bottom: 8px;
+    display: grid; grid-template-columns: 72px 1fr 40px;
+    align-items: center; gap: 7px; margin-bottom: 7px;
   }
-  .metric-svc { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text); font-weight: 500; }
+  .metric-svc { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text2); font-weight: 500; }
   .metric-bars { display: flex; flex-direction: column; gap: 2px; }
   .metric-bar-wrap { display: flex; align-items: center; gap: 4px; }
-  .metric-bar-label { font-size: 9px; color: var(--text2); width: 24px; }
-  .metric-bar-bg { flex: 1; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .metric-bar-label { font-size: 8px; color: var(--text3); width: 20px; }
+  .metric-bar-bg { flex: 1; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
   .metric-bar-fill { height: 100%; border-radius: 2px; transition: width 0.6s cubic-bezier(0.4,0,0.2,1), background 0.6s; }
   .bar-ok { background: var(--green); }
   .bar-warn { background: var(--orange); }
   .bar-crit { background: var(--red); }
-  .metric-err { font-family: 'JetBrains Mono', monospace; font-size: 10px; text-align: right; }
+  .metric-err { font-family: 'JetBrains Mono', monospace; font-size: 9px; text-align: right; }
 
-  /* Alerts */
+  /* ---- Alerts ---- */
   .alert-item {
-    display: flex; align-items: flex-start; gap: 8px;
-    padding: 8px 10px; border-radius: 6px; margin-bottom: 6px;
-    border-left: 3px solid;
-    font-size: 11px; animation: slide-in 0.25s ease;
+    display: flex; align-items: flex-start; gap: 7px;
+    padding: 7px 9px; border-radius: 5px; margin-bottom: 5px;
+    border-left: 2px solid; font-size: 10px;
+    animation: slide-in 0.22s ease;
   }
-  @keyframes slide-in { from { opacity:0; transform: translateX(-6px); } to { opacity:1; transform: translateX(0); } }
-  .alert-critical { background: #fef2f2; border-color: var(--red); color: #991b1b; }
-  .alert-warning { background: #fff7ed; border-color: var(--orange); color: #92400e; }
-  .alert-info { background: #eff6ff; border-color: var(--blue); color: #1e40af; }
-  .alert-sev { font-size: 9px; font-weight: 700; letter-spacing: 0.06em; margin-bottom: 2px; }
-  .alert-msg { font-size: 11px; line-height: 1.4; }
+  @keyframes slide-in { from { opacity:0; transform: translateX(-5px); } to { opacity:1; transform: translateX(0); } }
+  .alert-critical { background: rgba(239,68,68,0.1); border-color: var(--red); color: var(--red-bright); }
+  .alert-warning  { background: rgba(245,158,11,0.1); border-color: var(--orange); color: var(--orange); }
+  .alert-info     { background: rgba(59,130,246,0.1); border-color: var(--blue); color: var(--blue-bright); }
+  .alert-red-injected { border-color: #f43f5e; background: rgba(244,63,94,0.12); }
+  .alert-sev { font-size: 8px; font-weight: 700; letter-spacing: 0.06em; margin-bottom: 1px; opacity: 0.8; }
+  .alert-msg { font-size: 10px; line-height: 1.4; }
   .alert-svc { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
 
-  /* Topology */
-  .topology-graph { display: flex; flex-direction: column; gap: 6px; }
-  .topo-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  /* ---- Topology ---- */
+  .topology-graph { display: flex; flex-direction: column; gap: 5px; }
+  .topo-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .topo-node {
-    font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 500;
-    padding: 4px 10px; border-radius: 5px; background: #f1f5f9; border: 1px solid var(--border2);
-    color: var(--text); transition: all 0.3s;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 500;
+    padding: 3px 8px; border-radius: 4px; background: var(--bg3); border: 1px solid var(--border2);
+    color: var(--text2); transition: all 0.3s;
   }
-  .topo-node.affected { border-color: var(--red); color: var(--red); background: #fef2f2; }
-  .topo-node.mitigated { border-color: var(--green); color: var(--green); background: #f0fdf4; }
-  .topo-arrow { color: var(--text2); font-size: 11px; }
+  .topo-node.affected { border-color: var(--red); color: var(--red-bright); background: rgba(239,68,68,0.1); }
+  .topo-node.mitigated { border-color: var(--green); color: var(--green); background: rgba(16,185,129,0.1); }
+  .topo-node.red-spread { border-color: #f43f5e; color: #f43f5e; background: rgba(244,63,94,0.15); box-shadow: 0 0 8px rgba(244,63,94,0.3); }
+  .topo-arrow { color: var(--text3); font-size: 10px; }
 
-  /* ---- Center Panel: Action Feed ---- */
+  /* ---- Center Panel: Battle Feed ---- */
   .center-panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; background: var(--bg); }
-  .action-feed { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
-  .action-feed::-webkit-scrollbar { width: 4px; }
-  .action-feed::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+  .battle-feed { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 7px; }
+  .battle-feed::-webkit-scrollbar { width: 3px; }
+  .battle-feed::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
+  /* Battle cards */
   .action-card {
-    background: #ffffff;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 11px 14px;
-    box-shadow: var(--card-shadow);
-    animation: card-in 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 13px;
+    animation: card-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
-  @keyframes card-in { from { opacity:0; transform: translateY(10px) scale(0.98); } to { opacity:1; transform: translateY(0) scale(1); } }
-  .action-card.positive { border-left: 3px solid var(--green); }
-  .action-card.negative { border-left: 3px solid var(--red); }
-  .action-card.neutral  { border-left: 3px solid var(--border2); }
-  .action-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
-  .action-step { font-size: 10px; color: var(--text2); font-weight: 600; }
-  .action-type {
-    font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 500;
-    padding: 2px 7px; border-radius: 4px;
+  @keyframes card-in { from { opacity:0; transform: translateY(8px) scale(0.98); } to { opacity:1; transform: translateY(0) scale(1); } }
+  .action-card.blue-card { border-left: 3px solid var(--blue); box-shadow: var(--glow-blue); }
+  .action-card.red-card  { border-left: 3px solid var(--red);  box-shadow: var(--glow-red); }
+  .action-card.positive  { border-left-color: var(--green); }
+  .action-card.negative  { border-left-color: var(--red); }
+  .action-card.neutral   { border-left-color: var(--border2); }
+  .action-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .agent-label {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 3px; display: flex; align-items: center; gap: 4px;
   }
-  .action-type.mitigation { background: #f5f3ff; color: var(--purple); }
-  .action-type.investigation { background: #eff6ff; color: var(--blue); }
-  .action-type.terminal { background: #fefce8; color: var(--yellow); }
-  .action-params { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--text2); margin-bottom: 5px; }
-  .action-result { font-size: 12px; color: var(--text); line-height: 1.5; }
+  .agent-blue { background: rgba(59,130,246,0.15); color: var(--blue-bright); }
+  .agent-red  { background: rgba(239,68,68,0.15);  color: var(--red-bright); }
+  .action-type-badge {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 500;
+    padding: 2px 6px; border-radius: 3px;
+  }
+  .type-mitigation   { background: rgba(139,92,246,0.15); color: #a78bfa; }
+  .type-investigation{ background: rgba(59,130,246,0.15); color: var(--blue-bright); }
+  .type-terminal     { background: rgba(234,179,8,0.15); color: var(--yellow); }
+  .type-red-attack   { background: rgba(239,68,68,0.15); color: var(--red-bright); }
+  .action-result { font-size: 11px; color: var(--text2); line-height: 1.5; }
   .reward-badge {
-    display: inline-flex; align-items: center; gap: 3px;
-    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
-    padding: 2px 7px; border-radius: 4px;
+    display: inline-flex; align-items: center;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
+    padding: 2px 6px; border-radius: 3px;
   }
-  .reward-pos { color: var(--green); background: #f0fdf4; }
-  .reward-neg { color: var(--red); background: #fef2f2; }
-  .reward-zero { color: var(--text2); background: var(--bg3); }
+  .reward-pos  { color: var(--green); background: rgba(16,185,129,0.1); }
+  .reward-neg  { color: var(--red-bright); background: rgba(239,68,68,0.1); }
+  .reward-zero { color: var(--text3); background: var(--bg4); }
 
+  /* Thinking */
   .thinking-indicator {
-    display: flex; align-items: center; gap: 8px;
-    padding: 10px 14px; border-radius: 8px;
-    background: #f8fafc; border: 1px dashed var(--border2);
-    font-size: 12px; color: var(--text2); animation: thinking-pulse 1.5s infinite;
+    display: flex; align-items: center; gap: 7px;
+    padding: 9px 12px; border-radius: 7px;
+    background: var(--bg3); border: 1px dashed var(--border2);
+    font-size: 11px; color: var(--text3); animation: thinking-pulse 1.5s infinite;
   }
-  @keyframes thinking-pulse { 0%,100%{opacity:0.7} 50%{opacity:1} }
+  @keyframes thinking-pulse { 0%,100%{opacity:0.6} 50%{opacity:1} }
   .thinking-dots span {
-    display: inline-block; width: 5px; height: 5px; border-radius: 50%;
-    background: var(--blue); margin: 0 2px;
+    display: inline-block; width: 4px; height: 4px; border-radius: 50%;
+    background: var(--blue); margin: 0 1px;
     animation: dot-bounce 1.2s infinite;
   }
   .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
@@ -860,85 +1374,119 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Log stream */
   .log-stream {
     border-top: 1px solid var(--border);
-    height: 130px;
-    overflow-y: auto;
-    padding: 8px 14px;
-    flex-shrink: 0;
-    background: #1e293b;
+    height: 110px; overflow-y: auto;
+    padding: 7px 13px; flex-shrink: 0;
+    background: #050b14;
   }
-  .log-stream::-webkit-scrollbar { width: 3px; }
-  .log-stream::-webkit-scrollbar-thumb { background: #334155; }
-  .log-line { font-family: 'JetBrains Mono', monospace; font-size: 10px; line-height: 1.7; }
+  .log-stream::-webkit-scrollbar { width: 2px; }
+  .log-stream::-webkit-scrollbar-thumb { background: var(--border2); }
+  .log-line { font-family: 'JetBrains Mono', monospace; font-size: 9px; line-height: 1.8; }
   .log-error { color: #f87171; }
   .log-warn  { color: #fbbf24; }
-  .log-crit  { color: #fb923c; font-weight: 500; }
-  .log-info  { color: #94a3b8; }
+  .log-crit  { color: #fb923c; font-weight: 600; }
+  .log-info  { color: var(--text3); }
+  .log-red   { color: #f43f5e; font-weight: 600; }
 
   /* ---- Right Panel ---- */
   .right-panel { display: flex; flex-direction: column; background: var(--bg); }
-  .chart-wrap { padding: 12px 14px; border-bottom: 1px solid var(--border); background: #ffffff; }
-  .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: #ffffff; }
+  .chart-wrap { padding: 11px 13px; border-bottom: 1px solid var(--border); }
+
+  /* Score grid */
+  .score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; padding: 11px 13px; border-bottom: 1px solid var(--border); }
   .score-card {
     background: var(--bg3); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px; text-align: center;
-    box-shadow: var(--card-shadow);
+    border-radius: 7px; padding: 9px; text-align: center;
   }
-  .score-val { font-size: 20px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
-  .score-lbl { font-size: 9px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: var(--text2); margin-top: 2px; }
-  .score-big { grid-column: 1 / -1; background: #eff6ff; border-color: #bfdbfe; }
+  .score-val { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .score-lbl { font-size: 8px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text3); margin-top: 2px; }
+  .score-big { grid-column: 1 / -1; background: rgba(59,130,246,0.08); border-color: rgba(59,130,246,0.2); }
+  .score-blue { background: rgba(59,130,246,0.08); border-color: rgba(59,130,246,0.2); }
+  .score-red  { background: rgba(239,68,68,0.08);  border-color: rgba(239,68,68,0.2); }
 
-  .progress-wrap { padding: 12px 14px; background: #ffffff; flex: 1; }
-  .progress-item { margin-bottom: 12px; }
-  .progress-header { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; }
-  .progress-name { color: var(--text2); }
-  .progress-val { font-family: 'JetBrains Mono', monospace; color: var(--text); font-weight: 600; }
-  .progress-bar-bg { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  /* Progress bars */
+  .progress-wrap { padding: 11px 13px; flex: 1; overflow-y: auto; }
+  .progress-item { margin-bottom: 10px; }
+  .progress-header { display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 3px; }
+  .progress-name { color: var(--text3); }
+  .progress-val { font-family: 'JetBrains Mono', monospace; color: var(--text2); font-weight: 600; }
+  .progress-bar-bg { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
   .progress-bar-fill { height: 100%; border-radius: 3px; transition: width 0.8s cubic-bezier(0.4,0,0.2,1); }
 
-  /* Episode end overlay */
+  /* Curriculum panel */
+  .curriculum-wrap { padding: 11px 13px; border-top: 1px solid var(--border); }
+  .curriculum-header { font-size: 9px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .level-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 3px;
+    background: rgba(139,92,246,0.15); color: #a78bfa; border: 1px solid rgba(139,92,246,0.3);
+  }
+  .level-progress-bg { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 4px; }
+  .level-progress-fill { height: 100%; background: linear-gradient(90deg, var(--purple), var(--blue-bright)); border-radius: 2px; transition: width 1s; }
+  .level-desc { font-size: 9px; color: var(--text3); }
+
+  /* ---- Episode End Modal ---- */
   .episode-end {
     display: none; position: fixed; inset: 0; z-index: 200;
-    background: rgba(248,250,252,0.92); backdrop-filter: blur(8px);
+    background: rgba(10,15,30,0.88); backdrop-filter: blur(10px);
     align-items: center; justify-content: center;
   }
   .episode-end.show { display: flex; }
   .end-card {
-    background: #ffffff; border: 1px solid var(--border);
-    border-radius: 12px; padding: 36px; text-align: center;
-    max-width: 480px; width: 90%;
-    box-shadow: 0 20px 40px rgba(0,0,0,0.12);
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 14px; padding: 32px; text-align: center;
+    max-width: 500px; width: 92%;
+    box-shadow: 0 24px 50px rgba(0,0,0,0.5);
     animation: card-in 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
   }
-  .end-icon { font-size: 44px; margin-bottom: 10px; }
-  .end-title { font-size: 22px; font-weight: 700; margin-bottom: 6px; color: var(--text); }
-  .end-score { font-size: 52px; font-weight: 700; font-family: 'JetBrains Mono', monospace; margin-bottom: 14px; }
-  .end-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .end-icon { font-size: 40px; margin-bottom: 8px; }
+  .end-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .end-score { font-size: 46px; font-weight: 700; font-family: 'JetBrains Mono', monospace; margin-bottom: 16px; }
+  .end-vs { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; margin-bottom: 18px; }
   .end-col { padding: 12px; border-radius: 8px; }
-  .end-col-trained { background: #f0fdf4; border: 1px solid #bbf7d0; }
-  .end-col-untrained { background: #fef2f2; border: 1px solid #fecaca; }
-  .end-col-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 6px; }
-  .end-col-score { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
-  .end-col-trained .end-col-title { color: var(--green); }
-  .end-col-trained .end-col-score { color: var(--green); }
-  .end-col-untrained .end-col-title { color: var(--red); }
-  .end-col-untrained .end-col-score { color: var(--red); }
+  .end-col-blue { background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.25); }
+  .end-col-red  { background: rgba(239,68,68,0.1);  border: 1px solid rgba(239,68,68,0.25); }
+  .end-col-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 4px; }
+  .end-col-score { font-size: 24px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .end-col-blue .end-col-title { color: var(--blue-bright); }
+  .end-col-blue .end-col-score { color: var(--blue-bright); }
+  .end-col-red  .end-col-title { color: var(--red-bright); }
+  .end-col-red  .end-col-score { color: var(--red-bright); }
+  .vs-label { font-size: 12px; font-weight: 700; color: var(--text3); }
+  .winner-label { font-size: 13px; font-weight: 700; padding: 8px 18px; border-radius: 8px; margin-bottom: 18px; display: inline-block; }
+  .winner-blue { background: rgba(59,130,246,0.15); color: var(--blue-bright); border: 1px solid rgba(59,130,246,0.3); }
+  .winner-red  { background: rgba(239,68,68,0.15);  color: var(--red-bright);  border: 1px solid rgba(239,68,68,0.3); }
 
-  /* Info toast (replaces alert()) */
+  /* Toast */
   .toast {
-    position: fixed; bottom: 24px; right: 24px; z-index: 300;
-    background: var(--text); color: #ffffff; border-radius: 8px;
-    padding: 12px 18px; font-size: 13px; font-weight: 500;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-    animation: toast-in 0.3s ease; max-width: 360px;
+    position: fixed; bottom: 20px; right: 20px; z-index: 300;
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border2);
+    border-radius: 8px; padding: 11px 16px; font-size: 12px; font-weight: 500;
+    box-shadow: var(--card-shadow); animation: toast-in 0.3s ease; max-width: 340px;
   }
-  @keyframes toast-in { from { opacity:0; transform: translateY(12px); } to { opacity:1; transform: translateY(0); } }
+  @keyframes toast-in { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform: translateY(0); } }
 
-  /* Misc */
-  .empty-state { color: var(--text2); font-size: 12px; text-align: center; padding: 36px 20px; line-height: 1.7; }
-  .tag { font-size: 10px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+  /* Empty state */
+  .empty-state { color: var(--text3); font-size: 11px; text-align: center; padding: 32px 16px; line-height: 1.8; }
+
+  /* Self-improvement panel content */
+  .improvement-stats { display: flex; flex-direction: column; gap: 6px; }
+  .improvement-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 9px; border-radius: 5px; background: var(--bg3); border: 1px solid var(--border);
+    font-size: 10px;
+  }
+  .improvement-row-label { color: var(--text3); }
+  .improvement-row-val { font-family: 'JetBrains Mono', monospace; color: var(--text2); font-weight: 600; }
+  .level-up-event {
+    display: flex; align-items: center; gap: 7px;
+    padding: 6px 9px; border-radius: 5px;
+    background: rgba(139,92,246,0.1); border: 1px solid rgba(139,92,246,0.25);
+    font-size: 10px; color: #a78bfa;
+    animation: slide-in 0.3s ease;
+  }
 
   @media (max-width: 1100px) {
-    .main { grid-template-columns: 260px 1fr 240px; }
+    .main { grid-template-columns: 240px 1fr 240px; }
   }
 </style>
 </head>
@@ -950,118 +1498,258 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="header-left">
     <span class="logo">OpenSecOps<span>Env</span></span>
     <span class="badge badge-openenv">OpenEnv</span>
+    <span class="badge badge-self-improve">🧠 Self-Improving</span>
     <span class="badge badge-live" id="liveBadge" style="display:none">● Live</span>
   </div>
-  <div class="header-status">
-    <div class="status-dot"></div>
-    <span>Server online</span>
+  <div class="header-right">
+    <div class="header-status">
+      <div class="status-dot"></div>
+      <span>Server online</span>
+    </div>
   </div>
 </div>
 
-<!-- Controls -->
-<div class="controls">
-  <div class="control-group">
-    <span class="control-label">Scenario</span>
-    <select id="scenarioSelect">
-      <option value="easy_memory_leak">🟢 Memory Leak — Easy</option>
-      <option value="medium_ddos_cascade">🟡 DDoS Cascade — Medium</option>
-      <option value="medium_hard_bad_deployment">🟠 Bad Deployment — Medium-Hard</option>
-      <option value="hard_data_exfiltration" selected>🔴 Data Exfiltration — Hard</option>
-    </select>
-  </div>
-
-  <div class="control-group">
-    <span class="control-label">Agent Mode</span>
-    <div class="mode-toggle">
-      <button class="mode-btn active-trained" id="modeTrainedBtn" onclick="setMode('trained')">✦ Trained AI</button>
-      <button class="mode-btn" id="modeUntrainedBtn" onclick="setMode('untrained')">✗ Untrained</button>
-    </div>
-  </div>
-
-  <div class="control-group">
-    <span class="control-label">Speed</span>
-    <select id="speedSelect">
-      <option value="0.8">Fast</option>
-      <option value="1.5" selected>Normal</option>
-      <option value="2.5">Slow (Demo)</option>
-    </select>
-  </div>
-
-  <button class="btn btn-primary" id="startBtn" onclick="startDemo()">
-    ▶ Run Episode
-  </button>
-  <button class="btn btn-ghost" onclick="resetUI()">↺ Reset</button>
-  <button class="btn btn-ghost" onclick="showComparison()">⇄ Compare Agents</button>
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab active" id="tab-single"   onclick="switchTab('single')">🤖 Agent Demo</button>
+  <button class="tab"        id="tab-battle"   onclick="switchTab('battle')">⚔️ Battle Mode</button>
+  <button class="tab"        id="tab-improve"  onclick="switchTab('improve')">📈 Self-Improvement</button>
 </div>
 
-<!-- Main -->
-<div class="main">
-
-  <!-- LEFT: Scenario info + Metrics + Alerts + Topology -->
-  <div class="panel">
-    <div class="panel-header">
-      <span>System State</span>
-      <div class="panel-header-dot" style="background:var(--blue)"></div>
+<!-- ═══════════════════════════════ TAB: Single Agent ═══════════════════════════════ -->
+<div class="tab-panel active" id="panel-single" style="height:calc(100vh - 128px)">
+  <!-- Controls -->
+  <div class="controls">
+    <div class="control-group">
+      <span class="control-label">Scenario</span>
+      <select id="scenarioSelect">
+        <option value="easy_memory_leak">🟢 Memory Leak — Easy</option>
+        <option value="medium_ddos_cascade">🟡 DDoS Cascade — Medium</option>
+        <option value="medium_hard_bad_deployment">🟠 Bad Deployment — Medium-Hard</option>
+        <option value="hard_data_exfiltration" selected>🔴 Data Exfiltration — Hard</option>
+      </select>
     </div>
-    <div class="panel-body" id="leftPanel">
-      <div class="empty-state">
-        Select a scenario and click<br>
-        <strong>Run Episode</strong> to start the demo.
+    <div class="control-group">
+      <span class="control-label">Agent Mode</span>
+      <div class="mode-toggle">
+        <button class="mode-btn active-trained" id="modeTrainedBtn"   onclick="setMode('trained')">✦ Trained AI</button>
+        <button class="mode-btn"                id="modeUntrainedBtn" onclick="setMode('untrained')">✗ Untrained</button>
+      </div>
+    </div>
+    <div class="control-group">
+      <span class="control-label">Speed</span>
+      <select id="speedSelect">
+        <option value="0.8">Fast</option>
+        <option value="1.5" selected>Normal</option>
+        <option value="2.5">Slow (Demo)</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" id="startBtn" onclick="startDemo()">▶ Run Episode</button>
+    <button class="btn btn-ghost" onclick="resetUI()">↺ Reset</button>
+    <button class="btn btn-ghost" onclick="showComparison()">⇄ Compare</button>
+  </div>
+
+  <!-- 3-col layout -->
+  <div class="main">
+    <!-- LEFT: System State -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>System State</span>
+        <div class="panel-dot" style="background:var(--blue)"></div>
+      </div>
+      <div class="panel-body" id="leftPanel">
+        <div class="empty-state">Select a scenario and click<br><strong>Run Episode</strong> to start.</div>
+      </div>
+    </div>
+
+    <!-- CENTER: Action Feed -->
+    <div class="center-panel">
+      <div class="panel-header">
+        <span>Agent Action Feed</span>
+        <div class="panel-dot" style="background:var(--purple)"></div>
+      </div>
+      <div class="battle-feed" id="actionFeed">
+        <div class="empty-state">🤖 The agent will appear here<br>as it investigates the incident.</div>
+      </div>
+      <div class="log-stream" id="logStream">
+        <div class="log-line log-info">// System logs will stream here...</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Rewards + Scores -->
+    <div class="right-panel">
+      <div class="panel-header">
+        <span>Reward Curve</span>
+        <div class="panel-dot" style="background:var(--green)"></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="rewardChart" height="160"></canvas>
+      </div>
+      <div class="score-grid" id="scoreGrid">
+        <div class="score-card score-big">
+          <div class="score-val" id="scoreTotal" style="color:var(--text3)">—</div>
+          <div class="score-lbl">Final Score / 1.0</div>
+        </div>
+        <div class="score-card">
+          <div class="score-val" id="scoreCumReward" style="color:var(--cyan)">0.00</div>
+          <div class="score-lbl">Cumul. Reward</div>
+        </div>
+        <div class="score-card">
+          <div class="score-val" id="scoreSteps" style="color:var(--purple)">0</div>
+          <div class="score-lbl">Steps Taken</div>
+        </div>
+      </div>
+      <div class="progress-wrap" id="progressWrap">
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Diagnosis</span><span class="progress-val" id="pDiagnosis">—</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="pDiagnosisBar" style="width:0%;background:var(--cyan)"></div></div>
+        </div>
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Action Efficiency</span><span class="progress-val" id="pEfficiency">—</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="pEfficiencyBar" style="width:0%;background:var(--purple)"></div></div>
+        </div>
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Investigation Quality</span><span class="progress-val" id="pInvestigation">—</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="pInvestigationBar" style="width:0%;background:var(--green)"></div></div>
+        </div>
       </div>
     </div>
   </div>
+</div>
 
-  <!-- CENTER: Action feed + Log stream -->
-  <div class="center-panel">
-    <div class="panel-header">
-      <span>Agent Action Feed</span>
-      <div class="panel-header-dot" style="background:var(--purple)"></div>
+<!-- ═══════════════════════════════ TAB: Battle Mode ═══════════════════════════════ -->
+<div class="tab-panel" id="panel-battle" style="height:calc(100vh - 128px)">
+  <!-- Battle Controls -->
+  <div class="controls">
+    <div class="control-group">
+      <span class="control-label">Scenario</span>
+      <select id="battleScenarioSelect">
+        <option value="easy_memory_leak">🟢 Memory Leak — Easy</option>
+        <option value="medium_ddos_cascade">🟡 DDoS Cascade — Medium</option>
+        <option value="medium_hard_bad_deployment">🟠 Bad Deployment — Medium-Hard</option>
+        <option value="hard_data_exfiltration" selected>🔴 Data Exfiltration — Hard</option>
+      </select>
     </div>
-    <div class="action-feed" id="actionFeed">
-      <div class="empty-state">
-        🤖 The agent will appear here<br>as it investigates the incident.
-      </div>
+    <div class="control-group">
+      <span class="control-label">Speed</span>
+      <select id="battleSpeedSelect">
+        <option value="0.6">Fast</option>
+        <option value="1.2" selected>Normal</option>
+        <option value="2.0">Slow (Demo)</option>
+      </select>
     </div>
-    <div class="log-stream" id="logStream">
-      <div class="log-line log-info">// System logs will stream here during the episode...</div>
+    <button class="btn btn-primary" id="battleStartBtn" onclick="startBattle()">⚔️ Start Battle</button>
+    <button class="btn btn-ghost"   onclick="resetBattle()">↺ Reset</button>
+    <div style="margin-left:auto; display:flex; gap:10px; align-items:center; font-size:11px;">
+      <span style="color:var(--blue-bright); font-weight:600">🔵 Defender</span>
+      <span style="color:var(--text3)">vs</span>
+      <span style="color:var(--red-bright); font-weight:600">🔴 Attacker</span>
     </div>
   </div>
 
-  <!-- RIGHT: Chart + Scores -->
-  <div class="right-panel">
+  <!-- Battle 3-col -->
+  <div class="main">
+    <!-- LEFT: Battle System State -->
+    <div class="panel">
+      <div class="panel-header">
+        <span>Live System State</span>
+        <div class="panel-dot" style="background:var(--red)"></div>
+      </div>
+      <div class="panel-body" id="battleLeftPanel">
+        <div class="empty-state">Click <strong>⚔️ Start Battle</strong><br>to launch the live battle.</div>
+      </div>
+    </div>
+
+    <!-- CENTER: Battle Feed -->
+    <div class="center-panel">
+      <div class="panel-header">
+        <span id="battleFeedTitle">⚔️ Battle Feed</span>
+        <div class="panel-dot" style="background:var(--purple)"></div>
+      </div>
+      <div class="battle-feed" id="battleFeed">
+        <div class="empty-state">🔴 Attacker vs 🔵 Defender<br>will stream here in real-time.</div>
+      </div>
+      <div class="log-stream" id="battleLogStream">
+        <div class="log-line log-info">// Combat logs will appear here...</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Battle Scores -->
+    <div class="right-panel">
+      <div class="panel-header">
+        <span>Battle Score</span>
+        <div class="panel-dot" style="background:var(--cyan)"></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="battleChart" height="160"></canvas>
+      </div>
+      <div class="score-grid">
+        <div class="score-card score-blue">
+          <div class="score-val" id="blueScore" style="color:var(--blue-bright)">0.00</div>
+          <div class="score-lbl">🔵 Defender</div>
+        </div>
+        <div class="score-card score-red">
+          <div class="score-val" id="redScore" style="color:var(--red-bright)">0.00</div>
+          <div class="score-lbl">🔴 Attacker</div>
+        </div>
+        <div class="score-card score-big">
+          <div class="score-val" id="battleFinalScore" style="color:var(--text3)">—</div>
+          <div class="score-lbl">Episode Score / 1.0</div>
+        </div>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Defender Advantage</span><span class="progress-val" id="bAdvantage">—</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="bAdvantageBar" style="width:50%;background:var(--blue)"></div></div>
+        </div>
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Attack Suppression</span><span class="progress-val" id="bSuppression">—</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="bSuppressionBar" style="width:0%;background:var(--green)"></div></div>
+        </div>
+        <div class="progress-item">
+          <div class="progress-header"><span class="progress-name">Battle Rounds</span><span class="progress-val" id="bRounds">0</span></div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="bRoundsBar" style="width:0%;background:var(--orange)"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════ TAB: Self-Improvement ═══════════════════════════════ -->
+<div class="tab-panel" id="panel-improve" style="height:calc(100vh - 128px); flex-direction:row">
+  <div style="width:320px; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto;">
     <div class="panel-header">
-      <span>Reward Curve</span>
-      <div class="panel-header-dot" style="background:var(--green)"></div>
+      <span>Curriculum Progress</span>
+      <div class="panel-dot" style="background:var(--purple)"></div>
     </div>
-    <div class="chart-wrap">
-      <canvas id="rewardChart" height="160"></canvas>
+    <div class="panel-body" id="curriculumPanel">
+      <div class="empty-state">Run episodes to see<br>the self-improvement curriculum.</div>
     </div>
-    <div class="score-grid" id="scoreGrid">
-      <div class="score-card score-big">
-        <div class="score-val" id="scoreTotal" style="color:var(--text2)">—</div>
-        <div class="score-lbl">Final Score / 1.0</div>
-      </div>
-      <div class="score-card">
-        <div class="score-val" id="scoreCumReward" style="color:var(--cyan)">0.00</div>
-        <div class="score-lbl">Cumul. Reward</div>
-      </div>
-      <div class="score-card">
-        <div class="score-val" id="scoreSteps" style="color:var(--purple)">0</div>
-        <div class="score-lbl">Steps Taken</div>
-      </div>
+  </div>
+  <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+    <div class="panel-header">
+      <span>Learning Curve & Score History</span>
+      <div class="panel-dot" style="background:var(--green)"></div>
     </div>
-    <div class="progress-wrap" id="progressWrap">
-      <div class="progress-item">
-        <div class="progress-header"><span class="progress-name">Diagnosis</span><span class="progress-val" id="pDiagnosis">—</span></div>
-        <div class="progress-bar-bg"><div class="progress-bar-fill" id="pDiagnosisBar" style="width:0%;background:var(--cyan)"></div></div>
+    <div style="padding:14px; flex:1; display:flex; flex-direction:column; gap:14px; overflow-y:auto;">
+      <div style="background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:14px;">
+        <canvas id="improvementChart" height="200"></canvas>
       </div>
-      <div class="progress-item">
-        <div class="progress-header"><span class="progress-name">Action Efficiency</span><span class="progress-val" id="pEfficiency">—</span></div>
-        <div class="progress-bar-bg"><div class="progress-bar-fill" id="pEfficiencyBar" style="width:0%;background:var(--purple)"></div></div>
+      <div style="background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:14px;">
+        <div class="section-title" style="margin-bottom:10px">Level-Up Events</div>
+        <div id="levelUpEvents">
+          <div class="empty-state" style="padding:16px">No level-ups yet. Run episodes to progress!</div>
+        </div>
       </div>
-      <div class="progress-item">
-        <div class="progress-header"><span class="progress-name">Investigation Quality</span><span class="progress-val" id="pInvestigation">—</span></div>
-        <div class="progress-bar-bg"><div class="progress-bar-fill" id="pInvestigationBar" style="width:0%;background:var(--green)"></div></div>
+      <div style="background:linear-gradient(135deg,rgba(139,92,246,0.08),rgba(59,130,246,0.08)); border:1px solid rgba(139,92,246,0.2); border-radius:8px; padding:14px;">
+        <div class="section-title">How Self-Improvement Works</div>
+        <div style="font-size:11px; color:var(--text3); line-height:1.7;">
+          <div style="margin-bottom:6px">1. 🎯 <strong style="color:var(--text2)">Start at Level 1</strong> — easy tasks (memory leak)</div>
+          <div style="margin-bottom:6px">2. 📊 <strong style="color:var(--text2)">Score is tracked</strong> over a rolling window of 5 episodes</div>
+          <div style="margin-bottom:6px">3. ⬆️ <strong style="color:var(--text2)">Level up automatically</strong> when avg score exceeds threshold</div>
+          <div style="margin-bottom:6px">4. 🔴 <strong style="color:var(--red-bright)">Attacker gets harder</strong> as Blue agent improves</div>
+          <div>5. 🏆 <strong style="color:var(--green)">Level 5</strong> = expert: handle disguised data exfiltration + active attacker</div>
+        </div>
       </div>
     </div>
   </div>
@@ -1073,19 +1761,23 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="end-icon" id="endIcon">🎯</div>
     <div class="end-title" id="endTitle">Episode Complete</div>
     <div class="end-score" id="endScore">—</div>
-    <div class="end-comparison" id="endComparison" style="display:none">
-      <div class="end-col end-col-trained">
-        <div class="end-col-title">✦ Trained AI</div>
-        <div class="end-col-score" id="cmpTrained">—</div>
+    <div class="end-vs" id="endVs" style="display:none">
+      <div class="end-col end-col-blue">
+        <div class="end-col-title">🔵 Defender</div>
+        <div class="end-col-score" id="endBlueScore">—</div>
       </div>
-      <div class="end-col end-col-untrained">
-        <div class="end-col-title">✗ Untrained</div>
-        <div class="end-col-score" id="cmpUntrained">—</div>
+      <div class="vs-label">VS</div>
+      <div class="end-col end-col-red">
+        <div class="end-col-title">🔴 Attacker</div>
+        <div class="end-col-score" id="endRedScore">—</div>
       </div>
     </div>
-    <button class="btn btn-primary" onclick="closeEnd()" style="margin:0 auto;display:flex">
-      ↺ Run Again
-    </button>
+    <div id="endWinnerLabel"></div>
+    <div id="endComparison" style="display:none; margin-bottom:16px; text-align:left; font-size:11px; color:var(--text3)">
+      Trained: <span id="cmpTrained" style="color:var(--green); font-weight:700"></span> &nbsp;|&nbsp;
+      Untrained: <span id="cmpUntrained" style="color:var(--red-bright); font-weight:700"></span>
+    </div>
+    <button class="btn btn-primary" onclick="closeEnd()" style="margin:0 auto;display:flex">↺ Run Again</button>
   </div>
 </div>
 
@@ -1093,34 +1785,35 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <script>
 // ═══════════════════════════════════════════════════════
-// State
+// Global State
 // ═══════════════════════════════════════════════════════
 let currentMode = 'trained';
 let currentTask = 'hard_data_exfiltration';
 let sse = null;
+let battleSse = null;
 let rewardChart = null;
+let battleChart = null;
+let improvementChart = null;
 let steps = 0;
+let battleRounds = 0;
 let comparisonScores = {};
+let improvementData = { episodes: [], scores: [], levels: [] };
 
 const TASK_META = {
   'easy_memory_leak': {
-    name: 'Memory Leak — Auth Service',
-    diff: 'easy',
-    desc: 'The auth service has a progressive memory leak. Metrics show rising memory usage. The agent must investigate and restart the correct service.',
+    name: 'Memory Leak — Auth Service', diff: 'easy',
+    desc: 'The auth service has a progressive memory leak. Rising memory + latency. Agent must investigate and restart the correct service.',
   },
   'medium_ddos_cascade': {
-    name: 'DDoS Cascade Attack',
-    diff: 'medium',
-    desc: 'A DDoS attack from two IP ranges cascades through gateway → api → auth. The agent must correlate logs, block attacking IPs, and scale the API.',
+    name: 'DDoS Cascade Attack', diff: 'medium',
+    desc: 'A DDoS attack cascades through gateway → api → auth. Agent must correlate logs, block attacking IPs, and scale the API.',
   },
   'medium_hard_bad_deployment': {
-    name: 'Bad Deployment — Redis Misconfiguration',
-    diff: 'medium_hard',
-    desc: 'api v2.4.1 pushed an invalid Redis connection string, sending cache into a reconnect storm. The agent must rollback the deployment.',
+    name: 'Bad Deployment — Redis Misconfiguration', diff: 'medium_hard',
+    desc: 'api v2.4.1 pushed an invalid Redis connection string, causing a reconnect storm. Agent must rollback the deployment.',
   },
   'hard_data_exfiltration': {
-    name: 'Data Exfiltration (Disguised)',
-    diff: 'hard',
+    name: 'Data Exfiltration (Disguised)', diff: 'hard',
     desc: 'A compromised service account "reports_bot" is exfiltrating 4GB+ of data. 55% noise level with a false cache alert to mislead the responder.',
   },
 };
@@ -1132,93 +1825,144 @@ const ACTION_CLASS = {
   submit_diagnosis: 'terminal',
 };
 
-const ACTION_ICON = {
-  query_logs: '📋',inspect_metrics: '📊',run_security_scan: '🔍',
-  restart_service: '🔄',scale_service: '⚖️',block_ip: '🚫',
-  rollback_deployment: '⏪',isolate_service: '🔒',submit_diagnosis: '🎯',
+const RED_ACTION_CLASS = {
+  inject_noise: 'red-attack', amplify_attack: 'red-attack', corrupt_metric: 'red-attack',
+  create_false_alert: 'red-attack', accelerate_spread: 'red-attack',
 };
+
+const ACTION_ICON = {
+  query_logs:'📋', inspect_metrics:'📊', run_security_scan:'🔍',
+  restart_service:'🔄', scale_service:'⚖️', block_ip:'🚫',
+  rollback_deployment:'⏪', isolate_service:'🔒', submit_diagnosis:'🎯',
+  inject_noise:'🌫️', amplify_attack:'⚡', corrupt_metric:'💉',
+  create_false_alert:'🚨', accelerate_spread:'🦠',
+};
+
+// ═══════════════════════════════════════════════════════
+// Tab switching
+// ═══════════════════════════════════════════════════════
+function switchTab(name) {
+  ['single','battle','improve'].forEach(t => {
+    document.getElementById('panel-' + t).classList.toggle('active', t === name);
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+  });
+  if (name === 'improve') refreshCurriculum();
+}
 
 // ═══════════════════════════════════════════════════════
 // Chart init
 // ═══════════════════════════════════════════════════════
-function initChart() {
-  const ctx = document.getElementById('rewardChart').getContext('2d');
-  if (rewardChart) rewardChart.destroy();
-  rewardChart = new Chart(ctx, {
+function makeChart(canvasId, label1, color1, label2, color2) {
+  const ctx = document.getElementById(canvasId).getContext('2d');
+  return new Chart(ctx, {
     type: 'line',
     data: {
       labels: [],
       datasets: [{
-        label: 'Step Reward',
-        data: [],
-        borderColor: '#2563eb',
-        backgroundColor: 'rgba(37,99,235,0.08)',
-        borderWidth: 2,
-        pointRadius: 4,
-        pointBackgroundColor: '#2563eb',
-        tension: 0.3,
-        fill: true,
-      }, {
-        label: 'Cumulative',
-        data: [],
-        borderColor: '#16a34a',
-        borderWidth: 1.5,
-        borderDash: [4, 3],
-        pointRadius: 0,
-        tension: 0.3,
-        fill: false,
-      }]
+        label: label1, data: [], borderColor: color1,
+        backgroundColor: color1 + '20', borderWidth: 2,
+        pointRadius: 3, pointBackgroundColor: color1, tension: 0.3, fill: true,
+      }, ...(label2 ? [{
+        label: label2, data: [], borderColor: color2,
+        borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3, fill: false,
+      }] : [])],
     },
     options: {
-      responsive: true,
-      maintainAspectRatio: false,
+      responsive: true, maintainAspectRatio: false,
       animation: { duration: 400 },
       plugins: {
-        legend: {
-          labels: { color: '#64748b', font: { size: 10, family: 'JetBrains Mono' }, boxWidth: 12 }
-        },
-        tooltip: { backgroundColor: '#ffffff', titleColor: '#0f172a', bodyColor: '#64748b', borderColor: '#e2e8f0', borderWidth: 1 }
+        legend: { labels: { color: '#94a3b8', font: { size: 10, family: 'JetBrains Mono' }, boxWidth: 12 } },
+        tooltip: { backgroundColor: '#0d1426', titleColor: '#e2e8f0', bodyColor: '#94a3b8', borderColor: '#1e2d45', borderWidth: 1 },
       },
       scales: {
-        x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: 'rgba(226,232,240,0.8)' } },
-        y: {
-          ticks: { color: '#64748b', font: { size: 9, family: 'JetBrains Mono' } },
-          grid: { color: 'rgba(226,232,240,0.8)' },
-          min: -1.2, max: 1.2,
-        }
-      }
-    }
+        x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: 'rgba(30,45,69,0.8)' } },
+        y: { ticks: { color: '#64748b', font: { size: 9, family: 'JetBrains Mono' } }, grid: { color: 'rgba(30,45,69,0.8)' }, min: -1.2, max: 1.2 },
+      },
+    },
+  });
+}
+
+function initChart() {
+  const ctx = document.getElementById('rewardChart').getContext('2d');
+  if (rewardChart) rewardChart.destroy();
+  rewardChart = makeChart('rewardChart', 'Step Reward', '#3b82f6', 'Cumulative', '#10b981');
+}
+
+function initBattleChart() {
+  const ctx = document.getElementById('battleChart').getContext('2d');
+  if (battleChart) battleChart.destroy();
+  battleChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: '🔵 Defender', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
+        { label: '🔴 Attacker', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', borderWidth: 2, pointRadius: 3, tension: 0.3, fill: true },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      animation: { duration: 300 },
+      plugins: {
+        legend: { labels: { color: '#94a3b8', font: { size: 10, family: 'JetBrains Mono' }, boxWidth: 12 } },
+        tooltip: { backgroundColor: '#0d1426', titleColor: '#e2e8f0', bodyColor: '#94a3b8', borderColor: '#1e2d45', borderWidth: 1 },
+      },
+      scales: {
+        x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: 'rgba(30,45,69,0.8)' } },
+        y: { ticks: { color: '#64748b', font: { size: 9, family: 'JetBrains Mono' } }, grid: { color: 'rgba(30,45,69,0.8)' } },
+      },
+    },
+  });
+}
+
+function initImprovementChart() {
+  const ctx = document.getElementById('improvementChart').getContext('2d');
+  if (improvementChart) improvementChart.destroy();
+  improvementChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Episode Score', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', borderWidth: 2, pointRadius: 4, tension: 0.3, fill: true },
+        { label: 'Curriculum Level', data: [], borderColor: '#8b5cf6', borderWidth: 2, borderDash: [5, 3], pointRadius: 0, tension: 0, fill: false, yAxisID: 'y2' },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#94a3b8', font: { size: 10, family: 'JetBrains Mono' }, boxWidth: 12 } }, tooltip: { backgroundColor: '#0d1426', titleColor: '#e2e8f0', bodyColor: '#94a3b8', borderColor: '#1e2d45', borderWidth: 1 } },
+      scales: {
+        x: { ticks: { color: '#64748b', font: { size: 9 } }, grid: { color: 'rgba(30,45,69,0.8)' } },
+        y: { ticks: { color: '#64748b', font: { size: 9, family: 'JetBrains Mono' } }, grid: { color: 'rgba(30,45,69,0.8)' }, min: 0, max: 1 },
+        y2: { position: 'right', ticks: { color: '#8b5cf6', font: { size: 9 }, stepSize: 1 }, grid: { display: false }, min: 0, max: 5 },
+      },
+    },
   });
 }
 
 // ═══════════════════════════════════════════════════════
-// UI helpers
+// Single Agent UI helpers
 // ═══════════════════════════════════════════════════════
 function setMode(m) {
   currentMode = m;
-  document.getElementById('modeTrainedBtn').className = 'mode-btn' + (m==='trained' ? ' active-trained' : '');
-  document.getElementById('modeUntrainedBtn').className = 'mode-btn' + (m==='untrained' ? ' active-untrained' : '');
+  document.getElementById('modeTrainedBtn').className   = 'mode-btn' + (m==='trained'   ? ' active-trained'   : '');
+  document.getElementById('modeUntrainedBtn').className  = 'mode-btn' + (m==='untrained' ? ' active-untrained' : '');
 }
 
 function resetUI() {
   if (sse) { sse.close(); sse = null; }
   document.getElementById('actionFeed').innerHTML = '<div class="empty-state">🤖 The agent will appear here<br>as it investigates the incident.</div>';
-  document.getElementById('logStream').innerHTML = '<div class="log-line log-info">// System logs will stream here during the episode...</div>';
-  document.getElementById('leftPanel').innerHTML = '<div class="empty-state">Select a scenario and click<br><strong>Run Episode</strong> to start the demo.</div>';
-  document.getElementById('scoreTotal').textContent = '—';
-  document.getElementById('scoreTotal').style.color = 'var(--text2)';
+  document.getElementById('logStream').innerHTML  = '<div class="log-line log-info">// System logs will stream here...</div>';
+  document.getElementById('leftPanel').innerHTML  = '<div class="empty-state">Select a scenario and click<br><strong>Run Episode</strong> to start.</div>';
+  document.getElementById('scoreTotal').textContent    = '—';
+  document.getElementById('scoreTotal').style.color    = 'var(--text3)';
   document.getElementById('scoreCumReward').textContent = '0.00';
-  document.getElementById('scoreSteps').textContent = '0';
+  document.getElementById('scoreSteps').textContent    = '0';
   ['pDiagnosis','pEfficiency','pInvestigation'].forEach(id => document.getElementById(id).textContent = '—');
-  ['pDiagnosisBar','pEfficiencyBar','pInvestigationBar'].forEach(id => {
-    const el = document.getElementById(id);
-    el.style.width = '0%';
-  });
+  ['pDiagnosisBar','pEfficiencyBar','pInvestigationBar'].forEach(id => document.getElementById(id).style.width = '0%');
   document.getElementById('liveBadge').style.display = 'none';
   document.getElementById('startBtn').disabled = false;
   initChart();
   steps = 0;
-  // Note: we intentionally preserve comparisonScores so Compare still works after reset
 }
 
 function barClass(val, warn, crit) {
@@ -1227,10 +1971,9 @@ function barClass(val, warn, crit) {
   return 'bar-ok';
 }
 
-function renderLeftPanel(obs, taskId) {
+function renderSystemState(obs, taskId, panelId) {
   const meta = TASK_META[taskId] || {};
   const diff = meta.diff || 'easy';
-  // Track which services are affected from known task metadata (for topology highlighting)
   const affectedByTask = {
     'easy_memory_leak': ['auth'],
     'medium_ddos_cascade': ['api','auth','gateway'],
@@ -1246,27 +1989,26 @@ function renderLeftPanel(obs, taskId) {
       <span class="difficulty-badge diff-${diff}">${diff.toUpperCase()}</span>
     </div>`;
 
-  // Alerts
   if (obs.alerts && obs.alerts.length) {
     html += `<div class="section-title">Active Alerts</div>`;
     obs.alerts.slice(0, 6).forEach(a => {
-      const cls = a.severity === 'critical' ? 'alert-critical' : a.severity === 'warning' ? 'alert-warning' : 'alert-info';
+      const isRed = a._red_injected;
+      const cls = isRed ? 'alert-critical alert-red-injected' : (a.severity === 'critical' ? 'alert-critical' : a.severity === 'warning' ? 'alert-warning' : 'alert-info');
       html += `<div class="alert-item ${cls}">
         <div>
-          <div class="alert-sev">[${(a.severity||'info').toUpperCase()}]</div>
+          <div class="alert-sev">${isRed ? '[🔴 ATTACKER]' : '[' + (a.severity||'info').toUpperCase() + ']'}</div>
           <div class="alert-msg"><span class="alert-svc">${a.service}</span> · ${a.message || a.type}</div>
         </div></div>`;
     });
   }
 
-  // Metrics
   if (obs.metrics && Object.keys(obs.metrics).length) {
-    html += `<div class="section-title" style="margin-top:12px">Service Metrics</div>`;
+    html += `<div class="section-title" style="margin-top:10px">Service Metrics</div>`;
     Object.entries(obs.metrics).forEach(([svc, m]) => {
       const cpuCls = barClass(m.cpu, 60, 85);
       const memCls = barClass(m.memory, 70, 85);
       const latCls = m.latency > 500 ? 'bar-crit' : m.latency > 200 ? 'bar-warn' : 'bar-ok';
-      const errColor = m.error_rate > 10 ? 'var(--red)' : m.error_rate > 5 ? 'var(--orange)' : 'var(--text2)';
+      const errColor = m.error_rate > 10 ? 'var(--red-bright)' : m.error_rate > 5 ? 'var(--orange)' : 'var(--text3)';
       html += `<div class="metric-row">
         <span class="metric-svc">${svc}</span>
         <div class="metric-bars">
@@ -1279,62 +2021,62 @@ function renderLeftPanel(obs, taskId) {
     });
   }
 
-  // Topology — with affected/mitigated node highlighting
   if (obs.topology && Object.keys(obs.topology).length) {
-    html += `<div class="section-title" style="margin-top:12px">Service Topology</div><div class="topology-graph">`;
+    html += `<div class="section-title" style="margin-top:10px">Service Topology</div><div class="topology-graph">`;
     Object.entries(obs.topology).forEach(([svc, deps]) => {
       const nodeClass = affected.has(svc) ? 'affected' : '';
       html += `<div class="topo-row"><span class="topo-node ${nodeClass}">${svc}</span>`;
       if (deps.length) {
         html += `<span class="topo-arrow">→</span>`;
-        deps.forEach(d => {
-          const dClass = affected.has(d) ? 'affected' : '';
-          html += `<span class="topo-node ${dClass}">${d}</span>`;
-        });
+        deps.forEach(d => { html += `<span class="topo-node ${affected.has(d) ? 'affected' : ''}">${d}</span>`; });
       }
       html += `</div>`;
     });
     html += `</div>`;
   }
 
-  document.getElementById('leftPanel').innerHTML = html;
+  document.getElementById(panelId).innerHTML = html;
 }
 
-function appendAction(data) {
-  const feed = document.getElementById('actionFeed');
-  const isFirst = feed.querySelector('.empty-state');
-  if (isFirst) feed.innerHTML = '';
+function appendActionCard(feedId, step, agentType, actionType, params, reward, resultMsg, isRed) {
+  const feed = document.getElementById(feedId);
+  const isEmpty = feed.querySelector('.empty-state');
+  if (isEmpty) feed.innerHTML = '';
 
-  const r = data.reward;
-  const rClass = r > 0 ? 'positive' : r < 0 ? 'negative' : 'neutral';
-  const rBadgeClass = r > 0 ? 'reward-pos' : r < 0 ? 'reward-neg' : 'reward-zero';
+  const r = reward;
+  const rClass = r > 0 ? 'reward-pos' : r < 0 ? 'reward-neg' : 'reward-zero';
   const rSign = r > 0 ? '+' : '';
-  const aClass = ACTION_CLASS[data.action_type] || 'investigation';
-  const icon = ACTION_ICON[data.action_type] || '⚙️';
-  const params = Object.keys(data.parameters || {}).length ?
-    Object.entries(data.parameters).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ') : 'none';
+  const aClass = isRed ? 'type-red-attack' : (ACTION_CLASS[actionType] || 'type-investigation');
+  const cardClass = isRed ? 'red-card' : (r > 0 ? 'blue-card positive' : r < 0 ? 'blue-card negative' : 'blue-card neutral');
+  const icon = ACTION_ICON[actionType] || '⚙️';
+  const paramsStr = params && Object.keys(params).length ? Object.entries(params).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ') : 'auto';
+  const agentLabel = isRed
+    ? '<span class="agent-label agent-red">🔴 Attacker</span>'
+    : '<span class="agent-label agent-blue">🔵 Defender</span>';
 
   const card = document.createElement('div');
-  card.className = `action-card ${rClass}`;
+  card.className = `action-card ${cardClass}`;
   card.innerHTML = `
     <div class="action-header">
-      <span class="action-step">Step ${data.step}</span>
-      <span class="action-type ${aClass}">${icon} ${data.action_type}</span>
-      <span class="reward-badge ${rBadgeClass}">${rSign}${r.toFixed(2)}</span>
+      ${agentLabel}
+      <span class="action-type-badge ${aClass}">${icon} ${actionType}</span>
+      <span class="reward-badge ${rClass}">${rSign}${r.toFixed(2)}</span>
     </div>
-    <div class="action-params">params: ${params}</div>
-    <div class="action-result">${data.observation?.last_action_result || ''}</div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text3);margin-bottom:4px">${paramsStr}</div>
+    <div class="action-result">${resultMsg || ''}</div>
   `;
   feed.appendChild(card);
   feed.scrollTop = feed.scrollHeight;
 }
 
-function appendLogs(logs) {
+function appendLogs(streamId, logs, isRed) {
   if (!logs || !logs.length) return;
-  const stream = document.getElementById('logStream');
+  const stream = document.getElementById(streamId);
   logs.forEach(line => {
     const div = document.createElement('div');
-    const cls = line.includes('CRIT') ? 'log-crit' : line.includes('ERROR') ? 'log-error' : line.includes('WARN') ? 'log-warn' : 'log-info';
+    const cls = isRed
+      ? 'log-red'
+      : (line.includes('CRIT') ? 'log-crit' : line.includes('ERROR') ? 'log-error' : line.includes('WARN') ? 'log-warn' : 'log-info');
     div.className = `log-line ${cls}`;
     div.textContent = line;
     stream.appendChild(div);
@@ -1347,23 +2089,27 @@ function updateChart(rewardsHistory, cumulative) {
   const n = rewardsHistory.length;
   rewardChart.data.labels = Array.from({length: n}, (_, i) => `S${i+1}`);
   rewardChart.data.datasets[0].data = rewardsHistory;
-  // running cumulative
   let cum = 0;
-  rewardChart.data.datasets[1].data = rewardsHistory.map(r => { cum += r; return Math.round(cum * 100) / 100; });
+  rewardChart.data.datasets[1].data = rewardsHistory.map(r => { cum += r; return Math.round(cum*100)/100; });
   rewardChart.update('none');
 }
 
-function updateScores(data) {
-  document.getElementById('scoreCumReward').textContent = (data.cumulative_reward || 0).toFixed(2);
-  document.getElementById('scoreSteps').textContent = data.step || steps;
+function updateBattleChart(blueRewards, redRewards) {
+  if (!battleChart) return;
+  const maxLen = Math.max(blueRewards.length, redRewards.length);
+  battleChart.data.labels = Array.from({length: maxLen}, (_, i) => `R${i+1}`);
+  let bc = 0, rc = 0;
+  battleChart.data.datasets[0].data = blueRewards.map(r => { bc += r; return Math.round(bc*100)/100; });
+  battleChart.data.datasets[1].data = redRewards.map(r => { rc += r; return Math.round(rc*100)/100; });
+  battleChart.update('none');
 }
 
-function showThinking() {
-  const feed = document.getElementById('actionFeed');
+function showThinking(feedId, agentLabel) {
+  const feed = document.getElementById(feedId);
   const t = document.createElement('div');
   t.className = 'thinking-indicator';
   t.id = 'thinkingIndicator';
-  t.innerHTML = `🤖 Agent processing...&nbsp;<span class="thinking-dots"><span></span><span></span><span></span></span>`;
+  t.innerHTML = `${agentLabel} processing...&nbsp;<span class="thinking-dots"><span></span><span></span><span></span></span>`;
   feed.appendChild(t);
   feed.scrollTop = feed.scrollHeight;
 }
@@ -1373,27 +2119,9 @@ function hideThinking() {
   if (t) t.remove();
 }
 
-function showEpisodeEnd(gradeData) {
-  const score = gradeData.score;
-  const correct = gradeData.diagnosis_correct > 0.9;
-  document.getElementById('endIcon').textContent = correct ? '🏆' : score > 0.5 ? '✅' : '⚠️';
-  document.getElementById('endTitle').textContent = correct ? 'Incident Resolved!' : score > 0.5 ? 'Partially Resolved' : 'Episode Failed';
-  const scoreEl = document.getElementById('endScore');
-  scoreEl.textContent = score.toFixed(3);
-  scoreEl.style.color = score > 0.7 ? 'var(--green)' : score > 0.4 ? 'var(--yellow)' : 'var(--red)';
-
-  if (comparisonScores.trained && comparisonScores.untrained) {
-    document.getElementById('endComparison').style.display = 'grid';
-    document.getElementById('cmpTrained').textContent = comparisonScores.trained.toFixed(3);
-    document.getElementById('cmpUntrained').textContent = comparisonScores.untrained.toFixed(3);
-  }
-
-  document.getElementById('episodeEnd').classList.add('show');
-}
-
-function closeEnd() {
-  document.getElementById('episodeEnd').classList.remove('show');
-  resetUI();
+function updateScores(data) {
+  document.getElementById('scoreCumReward').textContent = (data.cumulative_reward || 0).toFixed(2);
+  document.getElementById('scoreSteps').textContent = data.step || steps;
 }
 
 function updateGradeUI(g) {
@@ -1417,14 +2145,29 @@ function updateGradeUI(g) {
   invBar.style.background = g.investigation_quality > 0.7 ? 'var(--green)' : g.investigation_quality > 0.4 ? 'var(--orange)' : 'var(--red)';
 }
 
+function showEpisodeEnd(score, icon, title, scoreColor) {
+  document.getElementById('endIcon').textContent  = icon;
+  document.getElementById('endTitle').textContent = title;
+  const scoreEl = document.getElementById('endScore');
+  scoreEl.textContent  = typeof score === 'number' ? score.toFixed(3) : score;
+  scoreEl.style.color  = scoreColor || 'var(--text)';
+  document.getElementById('endVs').style.display = 'none';
+  document.getElementById('endComparison').style.display = 'none';
+  document.getElementById('endWinnerLabel').innerHTML = '';
+  document.getElementById('episodeEnd').classList.add('show');
+}
+
+function closeEnd() {
+  document.getElementById('episodeEnd').classList.remove('show');
+}
+
 // ═══════════════════════════════════════════════════════
-// Main: run episode via SSE
+// Single-agent demo
 // ═══════════════════════════════════════════════════════
 function startDemo() {
   resetUI();
   currentTask = document.getElementById('scenarioSelect').value;
   const speed = document.getElementById('speedSelect').value;
-
   document.getElementById('startBtn').disabled = true;
   document.getElementById('liveBadge').style.display = 'inline-flex';
 
@@ -1435,39 +2178,46 @@ function startDemo() {
     const data = JSON.parse(e.data);
 
     if (data.type === 'reset') {
-      renderLeftPanel(data.observation, data.task_id);
-      showThinking();
+      renderSystemState(data.observation, data.task_id, 'leftPanel');
+      showThinking('actionFeed', '🤖 Agent');
     }
-
     else if (data.type === 'step') {
       hideThinking();
       steps = data.step;
-      appendAction(data);
-      appendLogs(data.observation?.logs);
-      renderLeftPanel(data.observation, currentTask);
+      appendActionCard('actionFeed', data.step, 'blue', data.action_type, data.parameters, data.reward, data.observation?.last_action_result, false);
+      appendLogs('logStream', data.observation?.logs, false);
+      renderSystemState(data.observation, currentTask, 'leftPanel');
       updateChart(data.rewards_history, data.cumulative_reward);
       updateScores(data);
-      if (!data.done) showThinking();
+      if (!data.done) showThinking('actionFeed', '🤖 Agent');
     }
-
     else if (data.type === 'grade') {
       hideThinking();
       document.getElementById('liveBadge').style.display = 'none';
       document.getElementById('startBtn').disabled = false;
       updateChart(data.rewards_history, data.cumulative_reward);
       updateGradeUI(data);
-      // Store for comparison
       comparisonScores[currentMode] = data.score;
-      setTimeout(() => showEpisodeEnd(data), 800);
+
+      // Record in improvement tracker
+      improvementData.episodes.push(improvementData.episodes.length + 1);
+      improvementData.scores.push(data.score);
+      improvementData.levels.push(1); // single agent always level 1
+
+      const correct = data.diagnosis_correct > 0.9;
+      setTimeout(() => showEpisodeEnd(
+        data.score,
+        correct ? '🏆' : data.score > 0.5 ? '✅' : '⚠️',
+        correct ? 'Incident Resolved!' : data.score > 0.5 ? 'Partially Resolved' : 'Episode Failed',
+        data.score > 0.7 ? 'var(--green)' : data.score > 0.4 ? 'var(--yellow)' : 'var(--red)'
+      ), 800);
       sse.close();
     }
-
     else if (data.type === 'error') {
       hideThinking();
       document.getElementById('startBtn').disabled = false;
       document.getElementById('liveBadge').style.display = 'none';
-      const feed = document.getElementById('actionFeed');
-      feed.innerHTML += `<div class="alert-item alert-critical"><div><div class="alert-sev">[ERROR]</div><div>${data.message}</div></div></div>`;
+      document.getElementById('actionFeed').innerHTML += `<div class="alert-item alert-critical"><div><div class="alert-sev">[ERROR]</div><div>${data.message}</div></div></div>`;
     }
   };
 
@@ -1491,18 +2241,217 @@ function showToast(msg, duration = 4000) {
 
 async function showComparison() {
   if (Object.keys(comparisonScores).length < 2) {
-    showToast('Run both "Trained AI" and "Untrained" modes first, then click Compare to see the difference!');
+    showToast('Run both "Trained AI" and "Untrained" modes first, then click Compare!');
     return;
   }
-  document.getElementById('endComparison').style.display = 'grid';
-  document.getElementById('cmpTrained').textContent = (comparisonScores.trained || 0).toFixed(3);
-  document.getElementById('cmpUntrained').textContent = (comparisonScores.untrained || 0).toFixed(3);
+  document.getElementById('endIcon').textContent  = '⇄';
+  document.getElementById('endTitle').textContent = 'Trained vs Untrained Agent';
   const diff = (comparisonScores.trained || 0) - (comparisonScores.untrained || 0);
-  document.getElementById('endIcon').textContent = '⇄';
-  document.getElementById('endTitle').textContent = `Trained vs Untrained Agent`;
-  document.getElementById('endScore').textContent = `+${(diff * 100).toFixed(0)}% better`;
-  document.getElementById('endScore').style.color = 'var(--green)';
+  const scoreEl = document.getElementById('endScore');
+  scoreEl.textContent = `+${(diff * 100).toFixed(0)}% better`;
+  scoreEl.style.color = 'var(--green)';
+  document.getElementById('endComparison').style.display = 'block';
+  document.getElementById('cmpTrained').textContent   = (comparisonScores.trained || 0).toFixed(3);
+  document.getElementById('cmpUntrained').textContent = (comparisonScores.untrained || 0).toFixed(3);
+  document.getElementById('endVs').style.display = 'none';
+  document.getElementById('endWinnerLabel').innerHTML = '';
   document.getElementById('episodeEnd').classList.add('show');
+}
+
+// ═══════════════════════════════════════════════════════
+// Battle Mode
+// ═══════════════════════════════════════════════════════
+function resetBattle() {
+  if (battleSse) { battleSse.close(); battleSse = null; }
+  document.getElementById('battleFeed').innerHTML = '<div class="empty-state">🔴 Attacker vs 🔵 Defender<br>will stream here in real-time.</div>';
+  document.getElementById('battleLogStream').innerHTML = '<div class="log-line log-info">// Combat logs will appear here...</div>';
+  document.getElementById('battleLeftPanel').innerHTML = '<div class="empty-state">Click <strong>⚔️ Start Battle</strong><br>to launch the live battle.</div>';
+  document.getElementById('blueScore').textContent = '0.00';
+  document.getElementById('redScore').textContent  = '0.00';
+  document.getElementById('battleFinalScore').textContent = '—';
+  document.getElementById('bAdvantage').textContent  = '—';
+  document.getElementById('bSuppression').textContent = '—';
+  document.getElementById('bRounds').textContent   = '0';
+  document.getElementById('bAdvantageBar').style.width  = '50%';
+  document.getElementById('bSuppressionBar').style.width = '0%';
+  document.getElementById('bRoundsBar').style.width  = '0%';
+  document.getElementById('battleStartBtn').disabled = false;
+  document.getElementById('liveBadge').style.display = 'none';
+  initBattleChart();
+  battleRounds = 0;
+}
+
+function startBattle() {
+  resetBattle();
+  const taskId = document.getElementById('battleScenarioSelect').value;
+  const speed  = document.getElementById('battleSpeedSelect').value;
+  document.getElementById('battleStartBtn').disabled = true;
+  document.getElementById('liveBadge').style.display = 'inline-flex';
+
+  let blueCum = 0, redCum = 0;
+  const blueRewardsHist = [], redRewardsHist = [];
+
+  const url = `/battle/stream?task_id=${taskId}&speed=${speed}`;
+  battleSse = new EventSource(url);
+
+  battleSse.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    if (data.type === 'battle_reset') {
+      renderSystemState(data.observation, taskId, 'battleLeftPanel');
+      showThinking('battleFeed', '⚔️ Battle');
+    }
+
+    else if (data.type === 'red_step') {
+      hideThinking();
+      battleRounds = data.round;
+      redCum = data.red_cumulative;
+      if (data.reward > 0) redRewardsHist.push(data.reward);
+      appendActionCard('battleFeed', data.round, 'red', data.action, {}, data.reward, data.message, true);
+      appendLogs('battleLogStream', [`🔴 [ATTACKER] ${data.message}`], true);
+      renderSystemState(data.observation, taskId, 'battleLeftPanel');
+      document.getElementById('redScore').textContent = redCum.toFixed(2);
+      if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
+      updateBattleBars(blueCum, redCum, data.round);
+      showThinking('battleFeed', '🔵 Defender');
+    }
+
+    else if (data.type === 'blue_step') {
+      hideThinking();
+      battleRounds = data.round;
+      blueCum = data.blue_cumulative;
+      if (data.reward !== 0) blueRewardsHist.push(data.reward);
+      appendActionCard('battleFeed', data.round, 'blue', data.action, data.parameters || {}, data.reward, data.result, false);
+      appendLogs('battleLogStream', data.observation?.logs, false);
+      renderSystemState(data.observation, taskId, 'battleLeftPanel');
+      document.getElementById('blueScore').textContent = blueCum.toFixed(2);
+      if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
+      updateBattleBars(blueCum, redCum, data.round);
+      showThinking('battleFeed', '🔴 Attacker');
+    }
+
+    else if (data.type === 'battle_end') {
+      hideThinking();
+      document.getElementById('liveBadge').style.display = 'none';
+      document.getElementById('battleStartBtn').disabled = false;
+      document.getElementById('battleFinalScore').textContent = data.score.toFixed(3);
+      document.getElementById('battleFinalScore').style.color = data.score > 0.7 ? 'var(--green)' : data.score > 0.4 ? 'var(--orange)' : 'var(--red)';
+      if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
+
+      // Record improvement
+      improvementData.episodes.push(improvementData.episodes.length + 1);
+      improvementData.scores.push(data.score);
+      improvementData.levels.push(1);
+
+      // Show end modal
+      const winner = data.winner;
+      document.getElementById('endVs').style.display     = 'grid';
+      document.getElementById('endComparison').style.display = 'none';
+      document.getElementById('endBlueScore').textContent = data.blue_cumulative.toFixed(2);
+      document.getElementById('endRedScore').textContent  = data.red_cumulative.toFixed(2);
+      document.getElementById('endWinnerLabel').innerHTML = winner === 'defender'
+        ? '<div class="winner-label winner-blue">🔵 Defender Wins!</div>'
+        : '<div class="winner-label winner-red">🔴 Attacker Wins!</div>';
+      setTimeout(() => showEpisodeEnd(
+        data.score,
+        winner === 'defender' ? '🛡️' : '💀',
+        winner === 'defender' ? 'Defender Wins!' : 'Attacker Wins!',
+        winner === 'defender' ? 'var(--blue-bright)' : 'var(--red-bright)'
+      ), 800);
+      battleSse.close();
+    }
+
+    else if (data.type === 'error') {
+      hideThinking();
+      document.getElementById('battleStartBtn').disabled = false;
+      document.getElementById('liveBadge').style.display = 'none';
+      document.getElementById('battleFeed').innerHTML += `<div class="alert-item alert-critical"><div><div class="alert-sev">[ERROR]</div><div>${data.message}</div></div></div>`;
+    }
+  };
+
+  battleSse.onerror = () => {
+    hideThinking();
+    document.getElementById('battleStartBtn').disabled = false;
+    document.getElementById('liveBadge').style.display = 'none';
+    if (battleSse) battleSse.close();
+  };
+}
+
+function updateBattleBars(blue, red, round) {
+  const total = Math.abs(blue) + Math.abs(red) || 1;
+  const blueAdv = blue / (total + Math.max(Math.abs(blue - red), 0.1));
+  const suppression = Math.max(0, blue / (Math.abs(blue) + 1));
+
+  document.getElementById('bAdvantage').textContent  = blue > red ? `+${(blue - red).toFixed(2)}` : `${(blue - red).toFixed(2)}`;
+  document.getElementById('bSuppression').textContent = `${(suppression * 100).toFixed(0)}%`;
+  document.getElementById('bRounds').textContent    = round;
+
+  document.getElementById('bAdvantageBar').style.width    = Math.min(100, Math.max(0, 50 + (blue - red) * 20)) + '%';
+  document.getElementById('bAdvantageBar').style.background = blue > red ? 'var(--blue)' : 'var(--red)';
+  document.getElementById('bSuppressionBar').style.width  = (suppression * 100) + '%';
+  document.getElementById('bRoundsBar').style.width = Math.min(round / 10 * 100, 100) + '%';
+}
+
+// ═══════════════════════════════════════════════════════
+// Self-Improvement Tab
+// ═══════════════════════════════════════════════════════
+async function refreshCurriculum() {
+  try {
+    const r = await fetch('/curriculum/summary');
+    const d = await r.json();
+    renderCurriculum(d);
+  } catch(e) {
+    document.getElementById('curriculumPanel').innerHTML = `<div class="empty-state">Could not load curriculum data.<br>Run episodes first.</div>`;
+  }
+}
+
+function renderCurriculum(d) {
+  const maxLevel = 5;
+  const pct = ((d.current_level - 1) / (maxLevel - 1)) * 100;
+  let html = `
+    <div class="section-title">Current Level</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <span class="level-badge">Level ${d.current_level} / ${maxLevel}</span>
+      <span style="font-size:10px;color:var(--text3)">${d.summary_text}</span>
+    </div>
+    <div class="level-progress-bg"><div class="level-progress-fill" style="width:${pct}%"></div></div>
+    <div class="level-desc" style="margin-bottom:12px">Progress to Level ${Math.min(d.current_level + 1, maxLevel)}</div>
+
+    <div class="section-title">Statistics</div>
+    <div class="improvement-stats">
+      <div class="improvement-row"><span class="improvement-row-label">Total Episodes</span><span class="improvement-row-val">${d.total_episodes}</span></div>
+      <div class="improvement-row"><span class="improvement-row-label">Level-Ups Achieved</span><span class="improvement-row-val">${d.level_up_history.length}</span></div>
+    </div>`;
+
+  if (d.level_up_history.length > 0) {
+    html += `<div class="section-title" style="margin-top:12px">Level-Up History</div>`;
+    d.level_up_history.forEach(lu => {
+      html += `<div class="level-up-event">⬆️ Ep ${lu.episode}: Level ${lu.from_level} → ${lu.to_level} (avg ${lu.avg_score.toFixed(3)})</div>`;
+    });
+  }
+
+  document.getElementById('curriculumPanel').innerHTML = html;
+
+  // Update level-up events panel
+  const luEl = document.getElementById('levelUpEvents');
+  if (d.level_up_history.length === 0) {
+    luEl.innerHTML = '<div class="empty-state" style="padding:16px">No level-ups yet. Run more episodes!</div>';
+  } else {
+    luEl.innerHTML = d.level_up_history.map(lu =>
+      `<div class="level-up-event" style="margin-bottom:5px">
+        ⬆️ Episode ${lu.episode}: <strong>Level ${lu.from_level} → ${lu.to_level}</strong>
+        &nbsp;·&nbsp; avg score <strong>${lu.avg_score.toFixed(3)}</strong>
+      </div>`
+    ).join('');
+  }
+
+  // Update improvement chart
+  if (improvementData.episodes.length > 0 && improvementChart) {
+    improvementChart.data.labels = improvementData.episodes.map(e => `Ep${e}`);
+    improvementChart.data.datasets[0].data = improvementData.scores;
+    improvementChart.data.datasets[1].data = improvementData.levels;
+    improvementChart.update('none');
+  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1510,6 +2459,8 @@ async function showComparison() {
 // ═══════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
   initChart();
+  initBattleChart();
+  initImprovementChart();
   document.getElementById('scenarioSelect').addEventListener('change', e => { currentTask = e.target.value; });
 });
 </script>
