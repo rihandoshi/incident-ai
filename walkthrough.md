@@ -1,199 +1,202 @@
-# LLM Run Analysis — Qwen/Qwen2.5-72B-Instruct
+# OpenSecOpsEnv — Full Project Walkthrough
 
-## Overall Result: 0.8417 average — this is VERY GOOD
+## What Is This?
 
-| Task | LLM Score | Heuristic (Cheat) | Gap | Verdict |
-|------|-----------|-------------------|-----|---------|
-| easy_memory_leak | **1.00** | 1.00 | 0.00 | Perfect |
-| medium_ddos_cascade | **0.73** | 0.90 | -0.17 | Made 2 wrong moves |
-| hard_data_exfiltration | **0.795** | 0.895 | -0.10 | Missed one service |
-| **Average** | **0.8417** | **0.9317** | -0.09 | Strong result |
+**OpenSecOpsEnv** is an OpenEnv-compliant reinforcement learning environment where an AI agent acts as an on-call security engineer. The agent must investigate and resolve production incidents across 4 escalating scenarios — from a simple memory leak to a disguised data exfiltration attack buried under 55% noise.
 
 ---
 
-## Task 1 — Easy Memory Leak: PERFECT (1.00)
+## 🤖 What Your Agent Does — Full Pipeline
 
 ```
-[STEP] step=1 action=inspect_metrics({})                              reward=+0.20
-[STEP] step=2 action=query_logs({"service": "auth"})                  reward=+0.20
-[STEP] step=3 action=restart_service({"service": "auth"})             reward=+0.50
-[STEP] step=4 action=submit_diagnosis({"label": "infra_failure:memory_leak"}) reward=+1.00
+┌────────────────────────────────────────────────────────────────┐
+│                     Episode Flow                               │
+│                                                                │
+│  env.reset(task_id)                                            │
+│       │                                                        │
+│       ▼                                                        │
+│  HiddenState (true root cause — NEVER shown to agent)         │
+│       │ drives                                                 │
+│       ▼                                                        │
+│  SecOpsObservation (alerts + metrics + logs + topology)        │
+│       │                                                        │
+│       ▼                                                        │
+│  LLM reads observation as text prompt                          │
+│       │                                                        │
+│       ▼                                                        │
+│  LLM outputs JSON: {"action_type": "...", "parameters": {...}} │
+│       │                                                        │
+│       ▼                                                        │
+│  env.step(action) → (new_obs, reward, done, info)             │
+│       │                                                        │
+│  GRPO uses reward to update model weights                      │
+│       │                                                        │
+│       └──── loop until done or max_steps ────────────────────┘
+│                                                                │
+│  grade(state) → score [0, 1]                                  │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-The model did exactly the right thing, in the right order:
-1. Looked at all metrics first → saw auth memory=88% → **+0.20** (useful investigation)
-2. Queried auth logs → confirmed "OutOfMemoryError" → **+0.20** (auth is the affected service)
-3. Restarted auth → the correct fix for a memory leak → **+0.50** (correct mitigation)
-4. Submitted the right label → **+1.00** (correct diagnosis)
+### The 4 Tasks
 
-**Score breakdown:**
-- diagnosis_correct = 1.0 → contributes 0.5 × 1.0 = **0.50**
-- action_efficiency = 1.0 → contributes 0.3 × 1.0 = **0.30** (all correct mitigations done, fast)
-- investigation_quality = 1.0 → contributes 0.2 × 1.0 = **0.20** (investigated the affected service)
-- **Total = 1.00**
+| Task | Incident | Root Cause | Noise | Max Steps |
+|------|----------|------------|-------|-----------|
+| easy_memory_leak | Auth service heap overflow | `infra_failure:memory_leak` | 5% | 30 |
+| medium_ddos_cascade | DDoS from 2 IP ranges → gateway → api → auth | `cyber_attack:ddos` | 25% | 40 |
+| medium_hard_bad_deployment | Bad Redis config in api v2.4.1 → cache reconnect storm | `misconfiguration:bad_config` | 35% | 45 |
+| hard_data_exfiltration | Compromised `reports_bot` exfiltrating 4GB via DB, false cache alert | `cyber_attack:data_exfiltration` | 55% | 50 |
 
----
+### Reward Design (Dense)
 
-## Task 2 — Medium DDoS: GOOD but 2 mistakes (0.73)
+| Action | Reward |
+|--------|--------|
+| Investigate affected service (first time) | +0.20 |
+| Security scan hits cyber attack target | +0.30 |
+| Correct mitigation step | +0.50 |
+| Correct diagnosis | +1.00 |
+| Investigate irrelevant service | −0.05 |
+| Wrong mitigation (e.g., restart wrong service) | −0.10 |
+| Harmful action (block legit IP, isolate healthy service) | −0.50 |
+| Wrong diagnosis | −1.00 |
+
+### Grader (Episode Score [0, 1])
 
 ```
-[STEP] step=1 action=inspect_metrics({})                            reward=+0.20  ✓
-[STEP] step=2 action=query_logs({"service": "gateway"})             reward=-0.05  ✗ (wrong target)
-[STEP] step=3 action=block_ip({"ip": "198.51.100.12"})              reward=+0.50  ✓
-[STEP] step=4 action=block_ip({"ip": "203.0.113.45"})               reward=+0.50  ✓
-[STEP] step=5 action=scale_service({"service": "gateway", "replicas": 3})  reward=-0.10 ✗ (wrong service)
-[STEP] step=6 action=run_security_scan({"target": "gateway"})       reward=-0.05  ✗ (wrong target)
-[STEP] step=7 action=submit_diagnosis({"label": "cyber_attack:ddos"}) reward=+1.00 ✓
-```
-
-**What the model got right:**
-- Found both attacking IPs from logs (198.51.100.12 and 203.0.113.45) and blocked them
-- Correctly identified the attack as DDoS
-
-**What the model got wrong:**
-
-**Mistake 1 — Step 2:** Queried logs on `gateway` instead of `api` or `auth`
-- The "affected services" are `api` and `auth` (the services being overwhelmed)
-- Gateway shows the attack traffic, but isn't the "affected" service in our environment's model
-- Result: **-0.05** (wasted investigation, no useful signal)
-
-**Mistake 2 — Step 5:** Scaled `gateway` instead of `api`
-- The correct mitigation is `scale_service:api` (scale the overloaded app servers)
-- Gateway is the entry point; scaling it doesn't help — you scale the backend
-- Result: **-0.10** (ineffective mitigation, not in correct_mitigations list)
-
-**Mistake 3 — Step 6:** Security scan on `gateway` (wrong place)
-- After already blocking both IPs, this was an unnecessary investigation
-- Again `gateway` isn't in the affected_services list
-- Result: **-0.05** (no signal returned)
-
-**Score breakdown:**
-```
-diagnosis_correct  = 1.0  (got the label right)
-mitigation_recall  = 2/3  (blocked 2 IPs ✓, but scaled wrong service ✗)
-                         → 0.667 of correct mitigations achieved
-step_bonus         = 1.0  (under the ideal step budget of 9)
-action_efficiency  = 0.7 × 0.667 + 0.3 × 1.0 = 0.467 + 0.300 = 0.767
-investigation_quality = 0/2 = 0.0  (never queried api or auth logs — only gateway)
-
-score = 0.5×1.0 + 0.3×0.767 + 0.2×0.0
-      = 0.50 + 0.23 + 0.00   = 0.73
-```
-
-The **0.20 investigation_quality penalty** is the main score killer — the model never queried logs or metrics specifically for `api` or `auth`, only `gateway`.
-
-**What would have gotten a perfect score:**
-```
-query_logs gateway       → might still get -0.05 (gateway not affected)
-                            OR query api/auth instead
-scale_service api        → +0.50 (not gateway)
-skip the 2nd security scan
+score = 0.5 × diagnosis_correct
+      + 0.3 × action_efficiency
+      + 0.2 × investigation_quality
 ```
 
 ---
 
-## Task 3 — Hard Data Exfiltration: Very Good (0.795)
+## 🧠 Training: GRPO with Unsloth
+
+**Model:** Qwen2.5-7B-Instruct (4-bit QLoRA via Unsloth)  
+**Algorithm:** Group Relative Policy Optimization (GRPO)  
+**Training file:** `colab_training.ipynb` (Google Colab, T4 GPU)
+
+### What GRPO does
+For each observation prompt, it generates **4 completions** (different JSON actions), runs each in the environment, gets rewards, then updates the model to increase probability of higher-reward completions relative to the group average.
 
 ```
-[STEP] step=1 action=inspect_metrics({})                       reward=+0.20  ✓
-[STEP] step=2 action=query_logs({"service": "db"})             reward=+0.20  ✓
-[STEP] step=3 action=run_security_scan({"target": "db"})       reward=+0.30  ✓
-[STEP] step=4 action=isolate_service({"service": "db"})        reward=+0.50  ✓
-[STEP] step=5 action=block_ip({"ip": "10.0.0.99"})             reward=+0.50  ✓
-[STEP] step=6 action=submit_diagnosis({"label": "cyber_attack:data_exfiltration"}) reward=+1.00 ✓
+Prompt (observation) → [action_1, action_2, action_3, action_4]
+                              ↓         ↓         ↓         ↓
+                           r=0.20    r=-0.05   r=0.50   r=-0.50
+                                              ↑ winner
+GRPO update: increase P(action_3) relative to group mean
 ```
 
-Every action the model took was correct! All rewards are positive. So why 0.795?
-
-**The model skipped** `query_logs auth` and `run_security_scan auth`.
-
-The environment has `affected_services = ["db", "auth"]`. The model only investigated `db`, missing that it should also check `auth` (where you'd find the privilege escalation of `reports_bot`).
-
-**Score breakdown:**
-```
-diagnosis_correct  = 1.0  (correct label: cyber_attack:data_exfiltration)
-mitigation_recall  = 2/4  (did: isolate_service:db ✓, block_ip:10.0.0.99 ✓)
-                           (missed: run_security_scan:db ✗*, run_security_scan:auth ✗)
-                           → 0.50 of correct mitigations
-step_bonus         = 1.0  (only 6 steps, ideal budget is 12)
-action_efficiency  = 0.7 × 0.50 + 0.3 × 1.0 = 0.35 + 0.30 = 0.65
-
-investigation_quality: which affected services (db, auth) did it QUERY?
-  - query_logs:db  → db ✓
-  - run_security_scan:db → db ✓ (already covered)
-  - NEVER queried auth → 0 credit for auth
-  investigated = {db} / {db, auth} = 0.5
-
-score = 0.5×1.0 + 0.3×0.65 + 0.2×0.5
-      = 0.500 + 0.195 + 0.100
-      = 0.795
-```
-
-*Note: `run_security_scan` actions go into `investigation_actions`, not `mitigation_actions`, so they don't get counted toward mitigation_recall even though they're in the correct_mitigations list. This is actually a nuance worth noting — the grader was designed so scans are "investigation" class actions, but the task config lists them as mitigations.
-
-**The impressive thing:** Even with 55% noise and a completely false alarm about the cache service, the model ignored the red herring and went straight to db. That's actually very smart behavior.
+### What the agent learns
+- Start with `inspect_metrics({})` to get overview (not random)
+- Follow the topology: gateway → api → auth (upstream = root cause)
+- Run `run_security_scan` before isolating services
+- Ignore false alerts (the cache in hard task is a decoy)
+- Submit exact diagnosis labels
 
 ---
 
-## How Good Is 0.84 Average?
+## 🎨 Dashboard Changes (Round 2 Retheme)
 
-Here's a scale of what scores mean:
+The dashboard was redesigned from **cyberpunk neon** to **clean minimal professional**:
 
-| Score Range | What it means |
-|-------------|---------------|
-| **0.90–1.00** | Nearly optimal — basically solving the task perfectly |
-| **0.75–0.90** | Strong — correct diagnosis, most mitigations right, some wasted moves |
-| **0.50–0.75** | Moderate — usually gets the label right but misses actions |
-| **0.25–0.50** | Weak — sometimes uses right category, lots of wrong actions |
-| **0.00–0.25** | Poor — wrong diagnosis, mostly harmful or random actions |
+| Before | After |
+|--------|-------|
+| Dark background `#050811` | Light background `#f8fafc` |
+| Neon cyan/green glows | Clean blue `#2563eb`, green `#16a34a`, red `#dc2626` |
+| Animated grid background | Clean white cards with subtle shadows |
+| `alert()` for comparison hint | Non-blocking toast notification |
 
-**Your Qwen 72B scored 0.84 average** — that's in the "Strong" band. It:
-- Got all 3 diagnoses 100% correct
-- Found the attacking IPs from raw log text
-- Ignored a deliberate red herring on the hard task
-- Was efficient (never hit the step limit)
-
-The only weaknesses are **target specificity** — it focused on `gateway` (the visible entry point) rather than `api`/`auth` (the overwhelmed services behind it) in the medium task.
-
----
-
-## Why Does This Matter for the Competition?
-
-The competition judges will run an "Open LLM agent" (probably Llama or Nemotron) against your environment. Your environment's quality is judged by:
-
-1. **Are tasks realistic and well-designed?** — Yes (SecOps domain)
-2. **Do graders produce fair, meaningful scores?** — Yes (0.73 is genuinely "almost right")
-3. **Is there meaningful difficulty progression?** — Easy=1.00, Medium=0.73, Hard=0.795 shows it
-4. **Does the hard task genuinely challenge frontier models?** — 0.795 vs 1.00 max shows real challenge
-
-A Qwen 72B getting ~0.84 while the "cheat sheet" heuristic gets 0.93 shows your environment has the right difficulty curve — hard enough to be interesting, not impossible.
+### Bugs Fixed (10 total)
+1. ✅ Topology nodes now highlight in red when they're affected services
+2. ✅ Log stream clears properly on episode reset
+3. ✅ `alert()` replaced with `showToast()` (non-blocking)
+4. ✅ Progress bar colors are now dynamic (green/orange/red based on score)
+5. ✅ Score total color resets to neutral on UI reset
+6. ✅ `comparisonScores` preserved across `resetUI()` so Compare works after replay
+7. ✅ Latency bar scale fixed (was /5000, now /2000 for better visibility)
+8. ✅ Chart theme updated to match clean palette
+9. ✅ Panel backgrounds consistent across all three columns
+10. ✅ Topology node `topo-node.affected` CSS was always defined but JS never applied the class — fixed
 
 ---
 
-## Docker: Not Installed
+## 📦 Files Overview
 
-The `docker` command failed because Docker Desktop isn't on your machine.
+```
+opensecops_env/
+├── env.py              # Core environment (reset/step/state)
+├── multi_agent_env.py  # ← NEW: Red vs Blue adversarial environment
+├── curriculum.py       # ← NEW: Procedural task generation & level ups
+├── models.py           # SecOpsAction, SecOpsObservation, SecOpsState
+├── grader.py           # Deterministic episode grader [0,1]
+├── tasks/
+│   └── task_definitions.py  # 4 base task configs
+└── server/
+    └── app.py          # FastAPI server + endpoints + dashboard
 
-**To install Docker Desktop for Windows:**
-1. Go to: https://www.docker.com/products/docker-desktop/
-2. Click **Download for Windows**
-3. Run the installer (requires restart)
-4. After restart, Docker Desktop starts automatically
+training/
+├── train_grpo.py       # GRPO training script (local)
+└── plot_rewards.py     # Reward curve generation
 
-Then run:
-```powershell
-# Build the image
-docker build -t opensecops-env:latest .
-
-# Run it
-docker run -p 8000:8000 opensecops-env:latest
-
-# In a new terminal window, test it:
-curl -X POST http://localhost:8000/reset -H "Content-Type: application/json" -d '{"task_id":"easy_memory_leak"}'
+colab_training.ipynb    # Full Colab notebook for HF credits
+inference.py            # Baseline heuristic agent
 ```
 
-Docker is required for:
-- The submission validator checking `docker build`
-- Deploying to Hugging Face Spaces (they run Docker containers)
+---
 
-**However, you can deploy to HF Spaces WITHOUT having Docker locally** — HF Spaces builds it on their servers. Local Docker is only needed for local testing and passing the validation script.
+## 🏆 Round 2 Theme Alignment
+
+| Theme | Status | Evidence |
+|-------|--------|---------|
+| **Long-Horizon Planning** | ✅ Strong | 30–50 step episodes, sparse final reward, causal chain reasoning |
+| **World Modeling: Professional** | ✅ Strong | Real SecOps tools (block_ip, rollback_deployment), realistic metrics |
+| **Multi-Agent** | ✅ Strong | **Red vs Blue**: An attacker (Red) interleaves turns with the defender (Blue). Red actively obfuscates logs, spikes metrics, and injects false alerts while Blue investigates. |
+| **Self-Improvement** | ✅ Strong | **Curriculum Manager**: Environment dynamically scales difficulty. When agent scores > 0.72 consistently, it unlocks Level 2 (compound failures), Level 3 (unknown procedurally generated topologies), and Level 4 (Adversarial Red). |
+
+---
+
+## 🚀 How to Execute & Test
+
+### 1. Test the API Endpoints (Curriculum & Multi-Agent)
+Start the server locally:
+```bash
+uvicorn opensecops_env.server.app:app --reload
+```
+
+In another terminal, test the Curriculum endpoint:
+```bash
+curl http://localhost:8000/curriculum/summary
+# You will see the current level (1) and performance stats.
+```
+
+Test the Multi-Agent environment (Blue step, then Red step):
+```bash
+# Reset with "auto" to use curriculum
+curl -X POST http://localhost:8000/multi/reset \
+  -H "Content-Type: application/json" -d '{"task_id":"auto"}'
+
+# Blue takes a step
+curl -X POST http://localhost:8000/multi/blue/step \
+  -H "Content-Type: application/json" \
+  -d '{"action_type":"inspect_metrics", "parameters":{}}'
+
+# Red reacts (heuristic attacker)
+curl -X POST http://localhost:8000/multi/red/step \
+  -H "Content-Type: application/json" -d '{}'
+```
+
+### 2. View the Dashboard
+Go to `http://localhost:8000/dashboard` in your browser.
+Click **Run Episode** and you will see the new clean, minimal theme, functional topology highlighting, and fixed progress bars.
+
+### 3. Run the Colab Notebook (The Core Training Evidence)
+1. Upload `colab_training.ipynb` to Google Colab.
+2. Select a **T4 GPU** runtime (or A100 if using HF credits).
+3. Add your `HF_TOKEN` in Colab's Secrets tab.
+4. Run all cells. It will:
+   - Download the model and environment
+   - Run GRPO training using Unsloth
+   - Automatically generate `training_results.png` (learning curves)
+   - Push the fine-tuned adapter to Hugging Face.
+
+**Primary pitch to judges:** This environment isn't just a static puzzle. It actively fights back (Multi-Agent) and gets harder as the model learns (Self-Improvement), making it a true testbed for next-generation reasoning models.
