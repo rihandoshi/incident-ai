@@ -51,7 +51,7 @@ except ImportError:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from pydantic import BaseModel
 
 from opensecops_env.env import OpenSecOpsEnv
@@ -806,6 +806,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    """Redirect root to the live dashboard."""
+    return RedirectResponse(url="/dashboard")
 
 
 @app.get("/health")
