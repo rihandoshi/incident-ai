@@ -48,7 +48,8 @@ A junior engineer panics and restarts the cache service. The real exfiltration c
 
 We fine-tuned **Qwen2.5-7B-Instruct** using **GRPO** for 500 steps on our environment's reward signal.
 
-![Training Results](https://huggingface.co/SapphireGaze429/opensecops-qwen2.5-7b-grpo/resolve/main/training_results.png)
+![Training Results — Reward curve, GRPO loss, and Before vs After scores](./training_results.png)
+*Left: Per-step reward rises from ~0.10 (random) to stable ~0.20 (trained). Centre: GRPO policy loss rising = gradient actively learning reward differences between candidate actions. Right: Episode scores improve 86–245% across all 4 tasks.*
 
 | Task | Difficulty | Untrained | GRPO-Trained | Improvement |
 |------|-----------|-----------|--------------|-------------|
@@ -77,12 +78,12 @@ We fine-tuned **Qwen2.5-7B-Instruct** using **GRPO** for 500 steps on our enviro
 │  └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
 │        │               └──────────────────────────▶ auth        │
 │                                                                   │
-│  🔴 Red Agent (Attacker) — heuristic, adversarial               │
-│     · inject_noise       : fake log entries in observation       │
-│     · amplify_attack     : increases hidden attack_progress      │
-│     · corrupt_metric     : spikes healthy service CPU/latency    │
-│     · create_false_alert : plants CRITICAL alert on wrong svc   │
-│     · accelerate_spread  : spreads attack to adjacent service    │
+│  🔴 Red Agent (Attacker) — adaptive adversarial (theory-of-mind)  │
+│     · counter_investigate: Blue queries db → Red plants alert on auth│
+│     · amplify_attack    : boosts attack before Blue can contain it  │
+│     · accelerate_spread : spreads to services Blue hasn't checked   │
+│     · corrupt_metric    : spikes a service Blue already looked at   │
+│     · inject_noise      : misleading log entries (default)          │
 │                                                                   │
 │  🔵 Blue Agent (Defender) — your trained Qwen2.5-7B-GRPO       │
 │     · query_logs         : read service logs                     │

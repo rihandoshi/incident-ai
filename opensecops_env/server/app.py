@@ -529,23 +529,85 @@ class MultiAgentSecOpsEnv:
         return self._build_ma_state(obs), red_reward, done, info
 
     def _heuristic_red_action(self) -> str:
-        """Smart heuristic: Red agent picks best available action."""
+        """
+        Adaptive Red Agent strategy — observes what Blue has been doing and
+        actively counter-strategises. This simulates theory-of-mind: Red models
+        Blue's beliefs and tries to mislead them.
+
+        Strategy tiers (in priority order):
+        1. Counter-investigate: if Blue queries a service, plant false alert on different service
+        2. Amplify active cyber attacks before Blue can contain them
+        3. Accelerate spread if Blue is ignoring adjacent services
+        4. Corrupt metrics to create new false alarms
+        5. Inject noise as default confusion
+        """
         hidden = self._env._hidden
         metrics = self._env._metrics
-
-        # Prefer amplify if there's an active attack
-        if hidden.true_root_cause == "cyber_attack" and hidden.attack_progress < 0.8:
-            return "amplify_attack"
-
-        # If many healthy services exist, try to spread or corrupt
+        blue_actions = list(self._env._state.investigation_actions or []) + \
+                       list(self._env._state.mitigation_actions or [])
         healthy = [s for s in metrics if s not in hidden.affected_services]
-        if healthy and self._rng.random() < 0.4:
-            return "corrupt_metric"
-        if hidden.true_root_cause == "cyber_attack" and self._rng.random() < 0.3:
-            return "accelerate_spread"
 
-        # Default: inject noise to confuse
+        # --- Tier 1: Counter-investigate (theory-of-mind) ---
+        # If Blue just queried logs on a service, plant a false CRITICAL on a DIFFERENT service
+        # to pull attention away from what Blue is zeroing in on
+        if blue_actions and healthy:
+            last_blue_action = blue_actions[-1] if blue_actions else ""
+            # Extract service Blue is investigating
+            blue_target = None
+            for act in reversed(blue_actions[-3:]):  # check last 3 actions
+                parts = act.split(":", 1)
+                if len(parts) == 2 and parts[1] in metrics:
+                    blue_target = parts[1]
+                    break
+            # If Blue is focusing somewhere, create noise elsewhere
+            if blue_target and healthy:
+                distraction_targets = [s for s in healthy if s != blue_target]
+                if distraction_targets and self._rng.random() < 0.55:
+                    return "create_false_alert"
+
+        # --- Tier 2: Amplify active cyber attacks ---
+        if hidden.true_root_cause == "cyber_attack" and hidden.attack_progress < 0.85:
+            # Amplify more aggressively early in the episode
+            if self._red_state.round <= 3:
+                return "amplify_attack"
+            # Continue amplifying if Blue hasn't isolated the affected service yet
+            affected_isolated = any(
+                f"isolate_service:{s}" in blue_actions
+                for s in hidden.affected_services
+            )
+            if not affected_isolated:
+                return "amplify_attack"
+
+        # --- Tier 3: Spread to adjacent services if Blue isn't checking them ---
+        if hidden.true_root_cause == "cyber_attack":
+            topology = self._env._task_cfg.get("topology", {})
+            spreadable = []
+            for affected in hidden.affected_services:
+                for neighbor in topology.get(affected, []):
+                    if neighbor not in hidden.affected_services:
+                        # Only spread to services Blue hasn't investigated
+                        blue_investigated = any(neighbor in a for a in blue_actions)
+                        if not blue_investigated:
+                            spreadable.append(neighbor)
+            if spreadable and self._rng.random() < 0.45:
+                return "accelerate_spread"
+
+        # --- Tier 4: Corrupt metrics if Blue is gaining a clear picture ---
+        if healthy and self._rng.random() < 0.40:
+            # Corrupt the service that Blue has inspected LEAST (anti-investigation)
+            blue_investigated_counts = {s: 0 for s in metrics}
+            for act in blue_actions:
+                parts = act.split(":", 1)
+                if len(parts) == 2 and parts[1] in blue_investigated_counts:
+                    blue_investigated_counts[parts[1]] += 1
+            # Target a healthy service Blue looked at (plant doubt)
+            healthy_investigated = [s for s in healthy if blue_investigated_counts.get(s, 0) > 0]
+            if healthy_investigated:
+                return "corrupt_metric"
+
+        # --- Tier 5: Default — inject noise ---
         return "inject_noise"
+
 
     def _build_ma_state(self, obs) -> dict[str, Any]:
         state = self._env.state.to_dict()

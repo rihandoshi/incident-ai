@@ -15,11 +15,12 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- Copy project ----
 COPY opensecops_env/ /app/opensecops_env/
-COPY server/         /app/server/
-COPY openenv.yaml   /app/openenv.yaml
-COPY pyproject.toml /app/pyproject.toml
-COPY inference.py   /app/inference.py
-COPY README.md      /app/README.md
+COPY openenv.yaml       /app/openenv.yaml
+COPY pyproject.toml     /app/pyproject.toml
+COPY inference.py       /app/inference.py
+COPY README.md          /app/README.md
+COPY hf_blog_post.md    /app/hf_blog_post.md
+COPY training_results.png /app/training_results.png
 
 # ---- Install package (editable so imports resolve correctly) ----
 RUN pip install --no-cache-dir -e /app

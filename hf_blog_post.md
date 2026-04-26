@@ -179,6 +179,9 @@ LoRA adapters: `r=16`, targeting all attention + MLP projections. Merged to 16-b
 
 ### Training Curves
 
+![Training Results — Reward curve, GRPO loss curve, Before vs After](./training_results.png)
+*Left: Per-step reward rising from random baseline (~0.10) to trained level (~0.20). Centre: GRPO policy loss rising = gradient actively updating weights from reward differences (this is correct, healthy GRPO behaviour). Right: Episode scores across all 4 task difficulties after 500 training steps.*
+
 **Reward curve:** Average per-step reward rises from ~0.10 (random baseline) to a stable plateau of ~0.18–0.20. The per-step average is naturally bounded — most steps are neutral investigations (+0.0). The large rewards (+1.0 correct diagnosis, -1.0 wrong) only fire occasionally, so episode-level performance is the more meaningful metric.
 
 **Loss curve:** In GRPO, **rising policy loss is the signal that learning is happening** — not a problem. Loss near zero means the model is not differentiating between candidate responses. Rising loss from step ~100 onward confirms the policy gradient is finding meaningful reward differences and updating weights. This is exactly the expected training signature.
