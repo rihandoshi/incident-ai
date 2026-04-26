@@ -2166,6 +2166,14 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <button class="tab"        id="tab-improve"  onclick="switchTab('improve')">Learning</button>
 </div>
 
+<!-- ⚡ Cold-start notice — auto-hides after 60s or on dismiss -->
+<div id="coldStartBanner" style="background:rgba(251,191,36,0.08);border-bottom:1px solid rgba(251,191,36,0.25);padding:9px 20px;display:flex;align-items:center;gap:10px;font-size:12px;color:#d4a017;font-weight:500;">
+  <span style="font-size:15px">⚡</span>
+  <span><strong>AI Endpoint may be cold-starting.</strong> The inference endpoint scales to zero when idle to save costs. If the first episode shows <em>"AI timeout — using fallback"</em>, wait ~2 minutes and run again. Live AI inference will work once the endpoint is warm.</span>
+  <button onclick="document.getElementById('coldStartBanner').style.display='none'" style="margin-left:auto;background:none;border:none;color:#d4a017;cursor:pointer;font-size:16px;opacity:0.7;padding:0 4px" title="Dismiss">✕</button>
+</div>
+<script>setTimeout(()=>{const b=document.getElementById('coldStartBanner');if(b)b.style.display='none';},60000);</script>
+
 <!-- ═══════════════════════════════ TAB: Single Agent ═══════════════════════════════ -->
 <div class="tab-panel active" id="panel-single" style="height:calc(100vh - 128px)">
   <!-- Controls -->
