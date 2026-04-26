@@ -2766,7 +2766,10 @@ function startDemo() {
       // Record in improvement tracker
       improvementData.episodes.push(improvementData.episodes.length + 1);
       improvementData.scores.push(data.score);
-      improvementData.levels.push(1); // single agent always level 1
+      improvementData.levels.push(data.curriculum_level || 1);
+
+      // Refresh curriculum panel immediately (don't wait for tab click)
+      refreshCurriculum();
 
       const correct = data.diagnosis_correct > 0.9;
       const modeLabel = data.live_ai ? (data.agent_label || 'AI Model') : 'Heuristic';
@@ -2908,7 +2911,10 @@ function startBattle() {
       // Record improvement
       improvementData.episodes.push(improvementData.episodes.length + 1);
       improvementData.scores.push(data.score);
-      improvementData.levels.push(1);
+      improvementData.levels.push(data.curriculum_level || 1);
+
+      // Refresh curriculum panel immediately
+      refreshCurriculum();
 
       // Show end modal
       const winner = data.winner;
