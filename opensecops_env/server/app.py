@@ -42,6 +42,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+# Auto-load .env file so HF_TOKEN etc. are always available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — fall back to env vars only
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -120,25 +127,140 @@ def _obs_to_text(obs: dict, step: int) -> str:
 
 
 def _parse_ai_action(text: str) -> Optional[SecOpsAction]:
-    """Parse JSON action from LLM response text."""
+    """
+    Parse JSON action from LLM response text.
+    Handles multiple output formats the model may produce.
+    """
     if isinstance(text, list):
         text = text[-1].get("content", "") if text else ""
     if not isinstance(text, str):
         text = str(text)
+
     # Strip markdown code fences
     text = re.sub(r"```[a-z]*\n?", "", text.strip()).strip()
-    # Extract first JSON object if wrapped in other text
-    m = re.search(r"\{.*\}", text, re.DOTALL)
+    text = re.sub(r"```", "", text).strip()
+
+    # Valid action types this environment accepts
+    VALID_ACTIONS = {
+        "query_logs", "inspect_metrics", "restart_service", "scale_service",
+        "block_ip", "rollback_deployment", "run_security_scan",
+        "isolate_service", "submit_diagnosis",
+    }
+
+    # Map common model-generated synonyms → valid action types
+    ACTION_SYNONYMS = {
+        "investigate": "query_logs",
+        "query": "query_logs",
+        "log_query": "query_logs",
+        "check_logs": "query_logs",
+        "metrics": "inspect_metrics",
+        "check_metrics": "inspect_metrics",
+        "inspect": "inspect_metrics",
+        "monitor": "inspect_metrics",
+        "restart": "restart_service",
+        "reboot": "restart_service",
+        "scale": "scale_service",
+        "block": "block_ip",
+        "ban": "block_ip",
+        "rollback": "rollback_deployment",
+        "revert": "rollback_deployment",
+        "scan": "run_security_scan",
+        "security_scan": "run_security_scan",
+        "isolate": "isolate_service",
+        "quarantine": "isolate_service",
+        "diagnose": "submit_diagnosis",
+        "diagnosis": "submit_diagnosis",
+        "submit": "submit_diagnosis",
+    }
+
+    # Diagnosis label synonyms
+    DIAGNOSIS_SYNONYMS = {
+        "memory_leak": "infra_failure:memory_leak",
+        "service_crash": "infra_failure:service_crash",
+        "bad_config": "misconfiguration:bad_config",
+        "ddos": "cyber_attack:ddos",
+        "data_exfiltration": "cyber_attack:data_exfiltration",
+        "exfiltration": "cyber_attack:data_exfiltration",
+        "privilege_escalation": "cyber_attack:privilege_escalation",
+    }
+
+    def _normalise_action(raw: str) -> str:
+        raw = raw.lower().strip().replace("-", "_").replace(" ", "_")
+        if raw in VALID_ACTIONS:
+            return raw
+        return ACTION_SYNONYMS.get(raw, "inspect_metrics")
+
+    # --- Try: extract first JSON object ---
+    m = re.search(r"\{.*?\}", text, re.DOTALL)
     if m:
-        text = m.group(0)
-    try:
-        d = json.loads(text)
-        return SecOpsAction(
-            action_type=d.get("action_type", "inspect_metrics"),
-            parameters=d.get("parameters", {}),
-        )
-    except Exception:
-        return None
+        try:
+            d = json.loads(m.group(0))
+            # Standard format: {"action_type": "...", "parameters": {...}}
+            if "action_type" in d:
+                atype = _normalise_action(d["action_type"])
+                params = d.get("parameters", {})
+                # Normalise diagnosis label if present
+                if "label" in params:
+                    params["label"] = DIAGNOSIS_SYNONYMS.get(params["label"], params["label"])
+                return SecOpsAction(action_type=atype, parameters=params)
+
+            # Alternate format: {"action": "INVESTIGATE", "details": {"hosts": ["db"]}}
+            if "action" in d:
+                raw_action = str(d.get("action", "")).lower()
+                details = d.get("details", d.get("parameters", {}))
+                atype = _normalise_action(raw_action)
+                # Extract service from details["hosts"] or details["services"]
+                params: dict[str, Any] = {}
+                hosts = details.get("hosts", details.get("services", []))
+                if hosts and isinstance(hosts, list) and hosts:
+                    svc = hosts[0]
+                    if atype in ("query_logs", "run_security_scan", "inspect_metrics",
+                                 "restart_service", "isolate_service"):
+                        params["service"] = svc
+                    elif atype == "block_ip":
+                        params["ip"] = svc
+                ips = details.get("ips", details.get("ip", []))
+                if ips:
+                    if isinstance(ips, list):
+                        params["ip"] = ips[0]
+                    else:
+                        params["ip"] = str(ips)
+                label = details.get("label", details.get("diagnosis", ""))
+                if label:
+                    params["label"] = DIAGNOSIS_SYNONYMS.get(label, label)
+                return SecOpsAction(action_type=atype, parameters=params)
+        except Exception:
+            pass
+
+    # --- Fallback: keyword scan of raw text ---
+    text_lower = text.lower()
+    # Check for diagnosis first (highest value)
+    for kw, label in DIAGNOSIS_SYNONYMS.items():
+        if kw.replace("_", " ") in text_lower or kw in text_lower:
+            return SecOpsAction(
+                action_type="submit_diagnosis",
+                parameters={"label": label},
+            )
+    # Then mitigations
+    for kw in ["isolate", "quarantine"]:
+        if kw in text_lower:
+            svc = "db" if "db" in text_lower else "auth"
+            return SecOpsAction(action_type="isolate_service", parameters={"service": svc})
+    for kw in ["block", "ban"]:
+        if kw in text_lower:
+            return SecOpsAction(action_type="block_ip", parameters={"ip": "10.0.0.99"})
+    if "restart" in text_lower or "reboot" in text_lower:
+        svc = "auth" if "auth" in text_lower else "api"
+        return SecOpsAction(action_type="restart_service", parameters={"service": svc})
+    if "scan" in text_lower or "security" in text_lower:
+        svc = "db" if "db" in text_lower else "api"
+        return SecOpsAction(action_type="run_security_scan", parameters={"target": svc})
+    if "log" in text_lower or "query" in text_lower or "investigate" in text_lower:
+        svc = "db" if "db" in text_lower else "auth"
+        return SecOpsAction(action_type="query_logs", parameters={"service": svc})
+
+    # Ultimate fallback
+    return SecOpsAction(action_type="inspect_metrics", parameters={})
 
 
 async def _query_ai_model(
