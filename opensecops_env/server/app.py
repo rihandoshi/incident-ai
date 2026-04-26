@@ -79,10 +79,11 @@ _UNTRAINED_ENDPOINT: Optional[str] = os.environ.get("UNTRAINED_MODEL_ENDPOINT", 
 _HF_API_TOKEN: str = os.environ.get("HF_API_TOKEN", os.environ.get("HF_TOKEN", ""))
 
 if not _HF_API_TOKEN:
+    # ASCII-only: Windows consoles often use cp1252 and choke on emoji in print().
     print(
-        "\n⚠️  WARNING: HF_API_TOKEN / HF_TOKEN not set. "
+        "\nWARNING: HF_API_TOKEN / HF_TOKEN not set. "
         "The live AI endpoint will get 401 Unauthorized and fall back to heuristic playbooks.\n"
-        "   Fix: export HF_TOKEN=hf_xxxx before starting uvicorn.\n"
+        "   Fix: set HF_TOKEN=hf_xxxx before starting uvicorn.\n"
     )
 
 _AI_SYSTEM_PROMPT = """You are an expert on-call security engineer responding to a production incident.
@@ -1646,7 +1647,6 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="description" content="Live AI Demo: Red Attacker vs Blue Defender agent battle with self-improving curriculum learning. OpenEnv Hackathon submission.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Poppins:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #f5f7fb;
@@ -2104,13 +2104,36 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     .panel, .center-panel, .right-panel { min-height: 280px; }
   }
+
+  /* Shepherd.js — product tour */
+  .shepherd-element { border-radius: 10px; max-width: min(380px, 92vw); }
+  .shepherd-element.shepherd-theme-opensecops { box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(15, 23, 42, 0.06); border: 1px solid var(--border); }
+  .shepherd-theme-opensecops .shepherd-content { border-radius: 10px; overflow: hidden; }
+  .shepherd-theme-opensecops .shepherd-header { padding: 16px 18px 0; background: #fff; }
+  .shepherd-theme-opensecops .shepherd-title { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); font-family: 'Poppins', 'Inter', sans-serif; }
+  .shepherd-theme-opensecops .shepherd-text { color: var(--text2); font-size: 13px; line-height: 1.5; padding: 0 18px 14px; background: #fff; font-family: 'Poppins', 'Inter', sans-serif; }
+  .shepherd-theme-opensecops .shepherd-footer {
+    padding: 12px 18px 14px; background: #f8fafc; border-top: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px; justify-content: flex-end;
+  }
+  .shepherd-theme-opensecops .shepherd-footer .shepherd-button-skip { margin-right: auto; }
+  .shepherd-theme-opensecops .shepherd-button { border-radius: 8px; font-weight: 600; font-size: 12px; padding: 8px 14px; font-family: 'Poppins', 'Inter', sans-serif; }
+  .shepherd-theme-opensecops .shepherd-button-secondary { background: #fff; color: var(--text2); border: 1px solid var(--border2); }
+  .shepherd-theme-opensecops .shepherd-button-primary { background: linear-gradient(90deg, #6b4de6, #0ea5a6); color: #fff; border: none; }
+  .shepherd-theme-opensecops .shepherd-button-skip {
+    background: transparent !important; border: none !important; color: var(--text3) !important;
+    font-weight: 500; padding: 8px 10px; box-shadow: none !important;
+  }
+  .shepherd-theme-opensecops .shepherd-button-skip:hover { color: var(--text2) !important; background: rgba(15, 23, 42, 0.06) !important; }
+  .shepherd-modal-overlay-container { z-index: 12000 !important; }
+  .shepherd-element { z-index: 12001 !important; }
 </style>
 </head>
 <body>
 <div class="app">
 
 <!-- Header -->
-<div class="header">
+<div class="header" id="tour-header">
   <div class="header-left">
     <span class="logo">OpenSecOps<span>Env</span></span>
     <span class="badge badge-openenv">OpenEnv</span>
@@ -2118,6 +2141,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span class="badge badge-live" id="liveBadge" style="display:none">● Streaming</span>
   </div>
   <div class="header-right" style="display:flex;align-items:center;gap:14px">
+    <button type="button" class="btn btn-ghost" id="tourReplayBtn" title="Start guided tour" style="font-size:11px;padding:6px 10px">Tour</button>
     <div id="aiStatusBadge" style="display:none;align-items:center;gap:6px;font-size:10px;font-weight:600;padding:4px 10px;border-radius:6px;background:rgba(14,165,166,0.12);color:#0f7879;border:1px solid rgba(14,165,166,0.3)">
       <span style="width:7px;height:7px;border-radius:50%;background:#11a36c;display:inline-block;animation:pulse-dot 1.5s infinite"></span>
       <span id="aiStatusText">AI Model Live</span>
@@ -2130,7 +2154,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <!-- Tab bar -->
-<div class="tab-bar">
+<div class="tab-bar" id="tour-tab-bar">
   <button class="tab active" id="tab-single"   onclick="switchTab('single')">Agent</button>
   <button class="tab"        id="tab-battle"   onclick="switchTab('battle')">Battle</button>
   <button class="tab"        id="tab-improve"  onclick="switchTab('improve')">Learning</button>
@@ -2139,7 +2163,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <!-- ═══════════════════════════════ TAB: Single Agent ═══════════════════════════════ -->
 <div class="tab-panel active" id="panel-single" style="height:calc(100vh - 128px)">
   <!-- Controls -->
-  <div class="controls">
+  <div class="controls" id="tour-controls-agent">
     <div class="control-group">
       <span class="control-label">Scenario</span>
       <select id="scenarioSelect">
@@ -2151,7 +2175,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="control-group">
       <span class="control-label">Agent Mode</span>
-      <div class="mode-toggle">
+      <div class="mode-toggle" id="tour-mode-toggle">
         <button class="mode-btn active-trained" id="modeTrainedBtn"   onclick="setMode('trained')">Trained Model</button>
         <button class="mode-btn"                id="modeUntrainedBtn" onclick="setMode('untrained')">Baseline Model</button>
       </div>
@@ -2165,14 +2189,16 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       </select>
     </div>
     <button class="btn btn-primary" id="startBtn" onclick="startDemo()">Run Episode</button>
+    <span id="tour-reset-compare" style="display:inline-flex;gap:8px;align-items:center;">
     <button class="btn btn-ghost" onclick="resetUI()">Reset</button>
     <button class="btn btn-ghost" onclick="showComparison()">Compare</button>
+    </span>
   </div>
 
   <!-- 3-col layout -->
-  <div class="main">
+  <div class="main" id="tour-agent-main">
     <!-- LEFT: System State -->
-    <div class="panel">
+    <div class="panel" id="tour-system-state-panel">
       <div class="panel-header">
         <span>System State</span>
         <div class="panel-dot" style="background:var(--blue)"></div>
@@ -2183,7 +2209,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- CENTER: Action Feed -->
-    <div class="center-panel">
+    <div class="center-panel" id="tour-action-feed-panel">
       <div class="panel-header">
         <span>Agent Action Feed</span>
         <div class="panel-dot" style="background:var(--purple)"></div>
@@ -2197,7 +2223,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- RIGHT: Rewards + Scores -->
-    <div class="right-panel">
+    <div class="right-panel" id="tour-reward-panel">
       <div class="panel-header">
         <span>Reward Curve</span>
         <div class="panel-dot" style="background:var(--green)"></div>
@@ -2240,7 +2266,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <!-- ═══════════════════════════════ TAB: Battle Mode ═══════════════════════════════ -->
 <div class="tab-panel" id="panel-battle" style="height:calc(100vh - 128px)">
   <!-- Battle Controls -->
-  <div class="controls">
+  <div class="controls" id="tour-controls-battle">
     <div class="control-group">
       <span class="control-label">Scenario</span>
       <select id="battleScenarioSelect">
@@ -2260,7 +2286,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <button class="btn btn-primary" id="battleStartBtn" onclick="startBattle()">Start Battle</button>
     <button class="btn btn-ghost"   onclick="resetBattle()">Reset</button>
-    <div style="margin-left:auto; display:flex; gap:10px; align-items:center; font-size:11px;">
+    <div id="tour-battle-legend" style="margin-left:auto; display:flex; gap:10px; align-items:center; font-size:11px;">
       <span style="color:var(--blue-bright); font-weight:600">Defender</span>
       <span style="color:var(--text3)">vs</span>
       <span style="color:var(--red-bright); font-weight:600">Attacker</span>
@@ -2268,7 +2294,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
   <!-- Battle 3-col -->
-  <div class="main">
+  <div class="main" id="tour-battle-main">
     <!-- LEFT: Battle System State -->
     <div class="panel">
       <div class="panel-header">
@@ -2281,7 +2307,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- CENTER: Battle Feed -->
-    <div class="center-panel">
+    <div class="center-panel" id="tour-battle-feed-panel">
       <div class="panel-header">
         <span id="battleFeedTitle">Battle Feed</span>
         <div class="panel-dot" style="background:var(--purple)"></div>
@@ -2295,7 +2321,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <!-- RIGHT: Battle Scores -->
-    <div class="right-panel">
+    <div class="right-panel" id="tour-battle-score-panel">
       <div class="panel-header">
         <span>Battle Score</span>
         <div class="panel-dot" style="background:var(--cyan)"></div>
@@ -2337,7 +2363,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- ═══════════════════════════════ TAB: Self-Improvement ═══════════════════════════════ -->
 <div class="tab-panel" id="panel-improve" style="height:calc(100vh - 128px); flex-direction:row">
-  <div style="width:320px; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto;">
+  <div id="tour-curriculum-sidebar" style="width:320px; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow-y:auto;">
     <div class="panel-header">
       <span>Curriculum Progress</span>
       <div class="panel-dot" style="background:var(--purple)"></div>
@@ -2346,7 +2372,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="empty-state">Run episodes to see<br>the self-improvement curriculum.</div>
     </div>
   </div>
-  <div style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+  <div id="tour-learning-main" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
     <div class="panel-header">
       <span>Learning Curve & Score History</span>
       <div class="panel-dot" style="background:var(--green)"></div>
@@ -2403,6 +2429,9 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 </div><!-- /app -->
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/shepherd.js@11.2.0/dist/css/shepherd.css">
+<script src="https://cdn.jsdelivr.net/npm/shepherd.js@11.2.0/dist/js/shepherd.min.js"></script>
 <script>
 // ═══════════════════════════════════════════════════════
 // Global State
@@ -3090,6 +3119,120 @@ function renderCurriculum(d) {
 }
 
 // ═══════════════════════════════════════════════════════
+// Onboarding (Shepherd.js) — first visit; dismiss marks complete
+// ═══════════════════════════════════════════════════════
+const ONBOARDING_STORAGE_KEY = 'opensecops_dashboard_onboarding_v4';
+
+function onboardingMarkComplete() {
+  try { localStorage.setItem(ONBOARDING_STORAGE_KEY, '1'); } catch (e) { /* private mode / quota */ }
+}
+
+function onboardingShouldRun() {
+  try { return localStorage.getItem(ONBOARDING_STORAGE_KEY) !== '1'; } catch (e) { return true; }
+}
+
+function startOnboardingTour() {
+  const S = window.Shepherd;
+  if (!S || typeof S.Tour !== 'function') {
+    console.warn('Shepherd.js failed to load; guided tour is unavailable.');
+    return;
+  }
+  switchTab('single');
+
+  let tour;
+  try {
+  tour = new S.Tour({
+    useModalOverlay: true,
+    defaultStepOptions: {
+      classes: 'shepherd-theme-opensecops',
+      scrollTo: { behavior: 'smooth', block: 'center', inline: 'nearest' },
+      modalOverlayOpeningPadding: 4,
+      canClickTarget: false,
+    },
+  });
+
+  const next = () => tour.next();
+  const back = () => tour.back();
+  const done = () => tour.complete();
+  const skip = () => tour.cancel();
+
+  const ensureAgent = () => { switchTab('single'); return Promise.resolve(); };
+  const ensureBattle = () => {
+    switchTab('battle');
+    return new Promise((r) => setTimeout(r, 120));
+  };
+  const ensureLearning = () => {
+    switchTab('improve');
+    return new Promise((r) => setTimeout(r, 120));
+  };
+
+  /** Skip always available; Back when not first step. */
+  function tourButtons(first, last) {
+    const buttons = [
+      { text: 'Skip', classes: 'shepherd-button-skip', action: skip },
+    ];
+    if (!first) {
+      buttons.push({ text: 'Back', classes: 'shepherd-button-secondary', action: back });
+    }
+    buttons.push({
+      text: last ? 'Finish' : 'Next',
+      classes: 'shepherd-button-primary',
+      action: last ? done : next,
+    });
+    return buttons;
+  }
+
+  tour.addStep({
+    id: 'intro',
+    title: 'Guided overview',
+    text: 'This console streams live incident simulations. The tour highlights where to configure a run and where results appear. For full field definitions, see the dashboard guide in the repository.',
+    buttons: tourButtons(true, false),
+  });
+
+  tour.addStep({
+    id: 'agent',
+    title: 'Agent workspace',
+    text: 'Use the header for connection status. Agent, Battle, and Learning switch workspaces. Here: pick a scenario and model mode, set playback speed, then Run Episode. The layout below is system state, action and log stream, then rewards and grading.',
+    attachTo: { element: '#tour-agent-main', on: 'bottom' },
+    beforeShowPromise: ensureAgent,
+    buttons: tourButtons(false, false),
+  });
+
+  tour.addStep({
+    id: 'battle',
+    title: 'Battle workspace',
+    text: 'Adversarial mode alternates attacker and defender turns. Start Battle from the control row; follow the feed in the center and cumulative metrics on the right.',
+    attachTo: { element: '#tour-battle-main', on: 'bottom' },
+    beforeShowPromise: ensureBattle,
+    buttons: tourButtons(false, false),
+  });
+
+  tour.addStep({
+    id: 'learning',
+    title: 'Learning workspace',
+    text: 'Curriculum progress and episode score history for this browser session. This tracks demonstration runs only; it is separate from offline model training.',
+    attachTo: { element: '#panel-improve', on: 'bottom' },
+    beforeShowPromise: ensureLearning,
+    buttons: tourButtons(false, true),
+  });
+
+  tour.on('complete', () => {
+    onboardingMarkComplete();
+    switchTab('single');
+  });
+
+  tour.on('cancel', () => {
+    onboardingMarkComplete();
+    switchTab('single');
+  });
+
+    tour.start();
+  } catch (e) {
+    console.error('Shepherd tour failed:', e);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
@@ -3097,6 +3240,14 @@ document.addEventListener('DOMContentLoaded', () => {
   initBattleChart();
   initImprovementChart();
   document.getElementById('scenarioSelect').addEventListener('change', e => { currentTask = e.target.value; });
+
+  const replay = document.getElementById('tourReplayBtn');
+  if (replay) {
+    replay.addEventListener('click', () => {
+      try { localStorage.removeItem(ONBOARDING_STORAGE_KEY); } catch (e) {}
+      startOnboardingTour();
+    });
+  }
 
   // Check AI status on load
   fetch('/ai/status').then(r => r.json()).then(d => {
@@ -3106,6 +3257,16 @@ document.addEventListener('DOMContentLoaded', () => {
       document.getElementById('aiStatusText').textContent = `🤖 ${d.model_name}`;
     }
   }).catch(() => {});
+
+  // First-time onboarding (no login in this app — first visit to dashboard).
+  // Add ?tour=1 to the URL to force the tour even if it was completed before.
+  const tourParams = new URLSearchParams(window.location.search);
+  const forceTour = tourParams.get('tour') === '1' || tourParams.get('tour') === 'true';
+  if (forceTour || onboardingShouldRun()) {
+    window.setTimeout(() => {
+      try { startOnboardingTour(); } catch (e) { console.error('Onboarding error:', e); }
+    }, 800);
+  }
 });
 </script>
 </body>
