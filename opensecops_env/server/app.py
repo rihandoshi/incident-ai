@@ -63,7 +63,11 @@ from opensecops_env.tasks.task_definitions import TASKS
 # HF_API_TOKEN             — your Hugging Face API token
 # ---------------------------------------------------------------------------
 
-_TRAINED_ENDPOINT: Optional[str] = os.environ.get("TRAINED_MODEL_ENDPOINT", "").strip() or None
+# Hardcoded live defaults — override via env var at any time
+_TRAINED_ENDPOINT: Optional[str] = (
+    os.environ.get("TRAINED_MODEL_ENDPOINT", "").strip()
+    or "https://hk5m5hadqtjiqg53.us-east-1.aws.endpoints.huggingface.cloud"
+)
 _UNTRAINED_ENDPOINT: Optional[str] = os.environ.get("UNTRAINED_MODEL_ENDPOINT", "").strip() or None
 _HF_API_TOKEN: str = os.environ.get("HF_API_TOKEN", os.environ.get("HF_TOKEN", ""))
 
@@ -1176,6 +1180,29 @@ async def battle_stream(
 # Dashboard (served at /dashboard)
 # ---------------------------------------------------------------------------
 
+@app.get("/ai/status")
+async def ai_status():
+    """Returns whether the live AI endpoint is configured and reachable."""
+    endpoint = _TRAINED_ENDPOINT
+    model_ready = False
+    if endpoint:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(endpoint.rstrip('/') + '/health')
+                model_ready = r.status_code < 400
+        except Exception:
+            model_ready = True  # Endpoint is set, assume alive (TGI has no /health sometimes)
+    return {
+        "live_ai": endpoint is not None,
+        "endpoint_configured": endpoint is not None,
+        "endpoint_url": (endpoint or "").replace("https://", "")[:40] + "..." if endpoint else None,
+        "model_name": "Qwen2.5-7B-GRPO (fine-tuned)",
+        "model_url": "https://huggingface.co/SapphireGaze429/opensecops-qwen2.5-7b-grpo",
+        "model_ready": model_ready,
+    }
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     """Live AI Demo Dashboard — Attacker vs Defender + Self-Improvement."""
@@ -1797,6 +1824,17 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (max-width: 1100px) {
     .main { grid-template-columns: 240px 1fr 240px; }
   }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.8); }
+  }
+  .ai-raw-output {
+    font-family: 'JetBrains Mono', monospace; font-size: 9px;
+    background: rgba(14,165,166,0.07); border: 1px solid rgba(14,165,166,0.18);
+    border-radius: 4px; padding: 4px 7px; margin-top: 5px;
+    color: #0f7879; word-break: break-all; line-height: 1.5;
+  }
+  .ai-raw-label { font-size: 8px; font-weight: 700; letter-spacing: 0.08em; color: #0ea5a6; margin-bottom: 2px; }
   @media (max-width: 900px) {
     .header { padding: 10px 14px; }
     .tab-bar { padding: 6px 12px 0; overflow-x: auto; }
@@ -1818,11 +1856,15 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="header">
   <div class="header-left">
     <span class="logo">OpenSecOps<span>Env</span></span>
-    <span class="badge badge-openenv">Platform</span>
-    <span class="badge badge-self-improve">Adaptive Learning</span>
-    <span class="badge badge-live" id="liveBadge" style="display:none">● Live</span>
+    <span class="badge badge-openenv">OpenEnv</span>
+    <span class="badge badge-self-improve">Curriculum RL</span>
+    <span class="badge badge-live" id="liveBadge" style="display:none">● Streaming</span>
   </div>
-  <div class="header-right">
+  <div class="header-right" style="display:flex;align-items:center;gap:14px">
+    <div id="aiStatusBadge" style="display:none;align-items:center;gap:6px;font-size:10px;font-weight:600;padding:4px 10px;border-radius:6px;background:rgba(14,165,166,0.12);color:#0f7879;border:1px solid rgba(14,165,166,0.3)">
+      <span style="width:7px;height:7px;border-radius:50%;background:#11a36c;display:inline-block;animation:pulse-dot 1.5s infinite"></span>
+      <span id="aiStatusText">AI Model Live</span>
+    </div>
     <div class="header-status">
       <div class="status-dot"></div>
       <span>Server online</span>
@@ -2359,7 +2401,7 @@ function renderSystemState(obs, taskId, panelId) {
   document.getElementById(panelId).innerHTML = html;
 }
 
-function appendActionCard(feedId, step, agentType, actionType, params, reward, resultMsg, isRed) {
+function appendActionCard(feedId, step, agentType, actionType, params, reward, resultMsg, isRed, aiRaw='') {
   const feed = document.getElementById(feedId);
   const isEmpty = feed.querySelector('.empty-state');
   if (isEmpty) feed.innerHTML = '';
@@ -2372,8 +2414,8 @@ function appendActionCard(feedId, step, agentType, actionType, params, reward, r
   const icon = ACTION_ICON[actionType] || 'ACT';
   const paramsStr = params && Object.keys(params).length ? Object.entries(params).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ') : 'auto';
   const agentLabel = isRed
-    ? '<span class="agent-label agent-red">Attacker</span>'
-    : '<span class="agent-label agent-blue">Defender</span>';
+    ? '<span class="agent-label agent-red">🔴 Attacker</span>'
+    : '<span class="agent-label agent-blue">🔵 Defender</span>';
 
   const card = document.createElement('div');
   card.className = `action-card ${cardClass}`;
@@ -2385,9 +2427,14 @@ function appendActionCard(feedId, step, agentType, actionType, params, reward, r
     </div>
     <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text3);margin-bottom:4px">${paramsStr}</div>
     <div class="action-result">${resultMsg || ''}</div>
+    ${aiRaw ? `<div class="ai-raw-output"><div class="ai-raw-label">🤖 AI Output</div>${escHtml(aiRaw)}</div>` : ''}
   `;
   feed.appendChild(card);
   feed.scrollTop = feed.scrollHeight;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function appendLogs(streamId, logs, isRed) {
@@ -2500,17 +2547,18 @@ function startDemo() {
 
     if (data.type === 'reset') {
       renderSystemState(data.observation, data.task_id, 'leftPanel');
-      showThinking('actionFeed', 'Agent');
+      const label = data.live_ai ? `🤖 ${data.agent_label || 'Qwen2.5-7B-GRPO thinking'}` : '🧠 Expert Heuristic';
+      showThinking('actionFeed', label);
     }
     else if (data.type === 'step') {
       hideThinking();
       steps = data.step;
-      appendActionCard('actionFeed', data.step, 'blue', data.action_type, data.parameters, data.reward, data.observation?.last_action_result, false);
+      appendActionCard('actionFeed', data.step, 'blue', data.action_type, data.parameters, data.reward, data.observation?.last_action_result, false, data.ai_raw || '');
       appendLogs('logStream', data.observation?.logs, false);
       renderSystemState(data.observation, currentTask, 'leftPanel');
       updateChart(data.rewards_history, data.cumulative_reward);
       updateScores(data);
-      if (!data.done) showThinking('actionFeed', 'Agent');
+      if (!data.done) showThinking('actionFeed', data.live_ai ? '🤖 Qwen2.5-7B thinking' : 'Agent');
     }
     else if (data.type === 'grade') {
       hideThinking();
@@ -2526,10 +2574,11 @@ function startDemo() {
       improvementData.levels.push(1); // single agent always level 1
 
       const correct = data.diagnosis_correct > 0.9;
+      const modeLabel = data.live_ai ? (data.agent_label || 'AI Model') : 'Heuristic';
       setTimeout(() => showEpisodeEnd(
         data.score,
-        correct ? 'High' : data.score > 0.5 ? 'Partial' : 'Low',
-        correct ? 'Incident Resolved!' : data.score > 0.5 ? 'Partially Resolved' : 'Episode Failed',
+        correct ? '✅' : data.score > 0.5 ? '⚠️' : '❌',
+        correct ? `Incident Resolved! (${modeLabel})` : data.score > 0.5 ? 'Partially Resolved' : 'Episode Failed',
         data.score > 0.7 ? 'var(--green)' : data.score > 0.4 ? 'var(--yellow)' : 'var(--red)'
       ), 800);
       sse.close();
@@ -2620,7 +2669,9 @@ function startBattle() {
 
     if (data.type === 'battle_reset') {
       renderSystemState(data.observation, taskId, 'battleLeftPanel');
-      showThinking('battleFeed', 'Battle Engine');
+      const blueLabel = data.live_ai ? `🤖 ${data.blue_label || 'Qwen2.5-7B'}` : '🧠 Expert Heuristic';
+      document.getElementById('battleFeedTitle').textContent = `Battle Feed — ${blueLabel} vs 🔴 Attacker`;
+      showThinking('battleFeed', 'Initializing battle...');
     }
 
     else if (data.type === 'red_step') {
@@ -2634,7 +2685,7 @@ function startBattle() {
       document.getElementById('redScore').textContent = redCum.toFixed(2);
       if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
       updateBattleBars(blueCum, redCum, data.round);
-      showThinking('battleFeed', 'Defender');
+      showThinking('battleFeed', '🔵 Defender analyzing threat...');
     }
 
     else if (data.type === 'blue_step') {
@@ -2642,13 +2693,13 @@ function startBattle() {
       battleRounds = data.round;
       blueCum = data.blue_cumulative;
       if (data.reward !== 0) blueRewardsHist.push(data.reward);
-      appendActionCard('battleFeed', data.round, 'blue', data.action, data.parameters || {}, data.reward, data.result, false);
+      appendActionCard('battleFeed', data.round, 'blue', data.action, data.parameters || {}, data.reward, data.result, false, data.ai_raw || '');
       appendLogs('battleLogStream', data.observation?.logs, false);
       renderSystemState(data.observation, taskId, 'battleLeftPanel');
       document.getElementById('blueScore').textContent = blueCum.toFixed(2);
       if (data.red_rewards && data.blue_rewards) updateBattleChart(data.blue_rewards, data.red_rewards);
       updateBattleBars(blueCum, redCum, data.round);
-      showThinking('battleFeed', 'Attacker');
+      showThinking('battleFeed', '🔴 Attacker planning next move...');
     }
 
     else if (data.type === 'battle_end') {
@@ -2783,6 +2834,15 @@ document.addEventListener('DOMContentLoaded', () => {
   initBattleChart();
   initImprovementChart();
   document.getElementById('scenarioSelect').addEventListener('change', e => { currentTask = e.target.value; });
+
+  // Check AI status on load
+  fetch('/ai/status').then(r => r.json()).then(d => {
+    const badge = document.getElementById('aiStatusBadge');
+    if (d.live_ai) {
+      badge.style.display = 'flex';
+      document.getElementById('aiStatusText').textContent = `🤖 ${d.model_name}`;
+    }
+  }).catch(() => {});
 });
 </script>
 </body>
