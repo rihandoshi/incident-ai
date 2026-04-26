@@ -1182,6 +1182,8 @@ async def demo_stream(
             # Final grade
             await asyncio.sleep(0.5)
             result = grade(env.state.to_dict())
+            # Record in curriculum so the Learning tab advances
+            _curriculum.record_score(task_id, result.score)
             yield _sse({
                 "type": "grade",
                 "score": round(result.score, 4),
@@ -1193,6 +1195,8 @@ async def demo_stream(
                 "cumulative_reward": round(cumulative, 4),
                 "live_ai": live_ai,
                 "agent_label": agent_label,
+                "curriculum_level": _curriculum.current_level,
+                "curriculum_episodes": _curriculum.episode_count,
             })
 
         except Exception as e:
@@ -1335,6 +1339,8 @@ async def battle_stream(
             await asyncio.sleep(0.5)
             result = grade(ma_env._env.state.to_dict())
             winner = "defender" if blue_cum > red_cum else "attacker"
+            # Record in curriculum so the Learning tab advances
+            _curriculum.record_score(task_id, result.score)
             yield _sse({
                 "type": "battle_end",
                 "score": round(result.score, 4),
@@ -1348,6 +1354,8 @@ async def battle_stream(
                 "red_rewards": red_rewards,
                 "details": result.details,
                 "live_ai": live_ai,
+                "curriculum_level": _curriculum.current_level,
+                "curriculum_episodes": _curriculum.episode_count,
             })
 
         except Exception as e:
