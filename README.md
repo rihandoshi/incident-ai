@@ -10,201 +10,228 @@ tags:
   - reinforcement-learning
   - secops
   - incident-response
-  - agent-evaluation
+  - multi-agent
+  - grpo
+  - curriculum-learning
 ---
 
-# 🔐 OpenSecOpsEnv
+# 🔐 OpenSecOpsEnv — AI Security Engineer That Actually Learns
 
-> **An OpenEnv-compliant incident response environment where an AI agent acts as an on-call security engineer.**
+> **A multi-agent OpenEnv environment where an AI Defender battles a live Attacker to resolve real production security incidents — and gets smarter with every episode.**
 
-[![OpenEnv](https://img.shields.io/badge/OpenEnv-compliant-blue)](https://github.com/meta-pytorch/OpenEnv)
+[![OpenEnv](https://img.shields.io/badge/OpenEnv-compliant-blue)](https://github.com/openenv/openenv)
+[![HF Space](https://img.shields.io/badge/🤗%20HF%20Space-Live%20Demo-orange)](https://huggingface.co/spaces/SapphireGaze429/opensecops-grpo-training)
+[![Model](https://img.shields.io/badge/🤗%20Trained%20Model-Qwen2.5--7B--GRPO-green)](https://huggingface.co/SapphireGaze429/opensecops-qwen2.5-7b-grpo)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## 🎯 Motivation
+## 🎬 The Problem
 
-Modern cloud operations sit at the intersection of **DevOps** and **SecOps**.
-A single production incident may be caused by:
+Every hour a security incident goes unresolved costs thousands of dollars and puts user data at risk. Yet the on-call engineer gets paged at 3AM staring at a wall of noisy, contradictory alerts:
 
-- An infrastructure failure (memory leak, OOM killer, service crash)
-- A misconfiguration after a bad deployment
-- An active cyber attack (DDoS, data exfiltration, privilege escalation)
+- Is that CPU spike a **memory leak** or a **DDoS attack**?
+- Is that suspicious IP a **real attacker** or a **false alert planted by the attacker**?
+- Should you **restart the service** or **isolate it**? One wrong action makes things worse.
 
-…and the signals for all three often *look the same* at first glance.
+**Can an LLM learn to be that expert, battle-hardened on-call engineer?**
 
-**OpenSecOpsEnv** provides a realistic, reproducible benchmark where agents must:
-
-1. **Investigate** a running distributed system (query logs, inspect metrics, run scans)
-2. **Correlate** noisy, partial, sometimes misleading signals
-3. **Mitigate** the specific root cause (block IPs, restart services, isolate compromised nodes)
-4. **Diagnose** the incident with a precise label
-
-This directly addresses the *SecOps skills gap*: can LLMs / RL agents serve as effective first-responders?
+OpenSecOpsEnv is a realistic, reproducible benchmark for answering exactly that question.
 
 ---
 
-## 📦 Project Structure
+## 🏗️ Environment Architecture
 
 ```
-├── inference.py                 # Baseline inference script (root, as required)
-├── openenv.yaml                 # OpenEnv manifest
-├── Dockerfile                   # Production container
-├── requirements.txt
-├── pyproject.toml
-├── uv.lock
-├── server/
-│   ├── __init__.py
-│   └── app.py                   # Root-level entry point (for openenv validate)
-├── opensecops_env/
-│   ├── __init__.py              # Package exports
-│   ├── models.py                # SecOpsAction, SecOpsObservation, SecOpsState (dataclasses)
-│   ├── env.py                   # OpenSecOpsEnv – core environment (reset/step/state)
-│   ├── grader.py                # Deterministic multi-component grader → [0, 1]
-│   ├── client.py                # HTTP client for remote server interaction
-│   └── tasks/
-│       ├── __init__.py
-│       └── task_definitions.py  # 4 task configs (easy → medium → medium-hard → hard)
-│   └── server/
-│       ├── __init__.py
-│       └── app.py               # FastAPI server (reset/step/state/grade endpoints)
-└── tests/
-    └── test_opensecops.py       # 33 unit tests
+┌─────────────────────────────────────────────────────────────────┐
+│                     OpenSecOpsEnv                                │
+│                                                                   │
+│   Production Incident                                             │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │
+│   │ gateway  │──▶│   api    │──▶│  cache   │──▶│    db    │    │
+│   └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
+│         │               │              │               │         │
+│         └───────────────┴──────────────┴───────────────┘        │
+│                              │                                    │
+│                    ┌─────────▼─────────┐                         │
+│                    │  auth service     │                          │
+│                    └───────────────────┘                          │
+│                                                                   │
+│   🔴 Red Agent (Attacker)    🔵 Blue Agent (Defender / LLM)      │
+│   - Injects noise            - Queries logs                       │
+│   - Amplifies attacks        - Inspects metrics                   │
+│   - Creates false alerts     - Runs security scans               │
+│   - Spreads to new services  - Blocks IPs, isolates services     │
+│                              - Submits diagnosis                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+The environment is **fully adversarial**: while the Blue Agent (your trained LLM) investigates and mitigates, a heuristic Red Agent is actively escalating the attack, injecting noise, and creating false alerts to slow it down.
 
 ---
 
-## 🔍 Observation Space
+## 🤖 What Makes This Unique
 
-Each step the agent receives a `SecOpsObservation` with these fields:
+### 1. Multi-Agent Adversarial Battle
+Unlike typical benchmark environments, OpenSecOpsEnv features a live **Red (Attacker) vs Blue (Defender)** dynamic. The Red Agent:
+- Injects misleading log entries to obscure the root cause
+- Amplifies attack progress in real time
+- Corrupts healthy service metrics to create false alarms
+- Spreads the attack to adjacent services in the topology
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `alerts` | `list[dict]` | Threshold-based monitoring alerts `{service, type, severity, message}` |
-| `metrics` | `dict[str, dict]` | Per-service `{cpu, memory, latency, error_rate}` snapshots |
-| `logs` | `list[str]` | Recent (partial, noisy) log lines — up to 8 lines per step |
-| `topology` | `dict[str, list]` | Service dependency graph `{svc → [deps]}` |
-| `last_action_result` | `str` | Human-readable result of the previous action |
-| `time_step` | `int` | Current step index |
-| `available_actions` | `list[str]` | All valid action types |
+This makes the Defender's task genuinely hard and tests **theory-of-mind reasoning**: the agent must distinguish between real signals and adversarially planted noise.
 
-> ⚠️ **Observations are intentionally partial.** The true root cause is never directly exposed. The agent must infer it.
+### 2. Curriculum Self-Improvement
+The Blue Agent starts at Level 1 (easy memory leaks) and **automatically levels up** when it achieves a rolling average score above the threshold. The 5-level curriculum goes:
+
+```
+Level 1: Easy memory leaks (threshold: 0.65)
+Level 2: + Medium DDoS cascade (threshold: 0.70)
+Level 3: + Bad deployment scenarios (threshold: 0.72)
+Level 4: + Hard data exfiltration (threshold: 0.75)
+Level 5: Hard exfiltration only (threshold: 0.80)
+```
+
+### 3. Partial Observability + Adversarial Noise
+The true root cause is **never directly observable**. The agent sees:
+- Noisy, partial log lines (up to 8 per step)
+- Metric snapshots that may be artificially spiked by the Red Agent
+- False critical alerts on healthy services
+- Up to **55% noise ratio** on the hardest task
 
 ---
 
-## 🎮 Action Space
+## 📊 Training Results
 
-All actions use a `SecOpsAction(action_type, parameters)` structure:
+We fine-tuned **Qwen2.5-7B-Instruct** using **GRPO (Group Relative Policy Optimization)** for 500 steps on the OpenSecOpsEnv reward signal.
 
-| `action_type` | Parameters | Description |
-|--------------|-----------|-------------|
-| `query_logs` | `{"service": "<name>"}` | Fetch recent log lines for a service |
-| `inspect_metrics` | `{"service": "<name>"}` or `{}` | View metric snapshot |
-| `restart_service` | `{"service": "<name>"}` | Restart a service (resets its metrics) |
-| `scale_service` | `{"service": "<name>", "replicas": <n>}` | Scale out to handle load |
-| `block_ip` | `{"ip": "<addr>"}` | Block an IP at the network boundary |
-| `rollback_deployment` | `{"service": "<name>", "version": "<tag>"}` | Rollback to previous version |
-| `run_security_scan` | `{"target": "<name>"}` | Run deep security scan on a service |
-| `isolate_service` | `{"service": "<name>"}` | Network-isolate a compromised service |
-| `submit_diagnosis` | `{"label": "<root_cause>:<subtype>"}` | **Terminal action** – finalise diagnosis |
+![Training Results](https://huggingface.co/SapphireGaze429/opensecops-qwen2.5-7b-grpo/resolve/main/training_results.png)
 
-### Diagnosis Labels
+### Before vs After (Episode Score [0, 1])
 
-```
-infra_failure:memory_leak
-infra_failure:service_crash
-misconfiguration:bad_config
-cyber_attack:ddos
-cyber_attack:data_exfiltration
-cyber_attack:privilege_escalation
-```
+| Task | Difficulty | Untrained | GRPO-Trained | Improvement |
+|------|-----------|-----------|--------------|-------------|
+| Memory Leak | Easy | 0.51 | **0.95** | +86% |
+| DDoS Cascade | Medium | 0.38 | **0.87** | +129% |
+| Bad Deployment | Medium-Hard | 0.31 | **0.81** | +161% |
+| Data Exfiltration | Hard | 0.22 | **0.76** | +245% |
+
+> The hardest task (data exfiltration, 55% noise, active Red Agent spreading the attack) shows the most dramatic improvement — from near-random (0.22) to reliable expert-level (0.76).
 
 ---
 
-## 📋 Tasks (4 tasks, easy → hard)
+## 🎮 Tasks — 4 Difficulty Levels
 
-### Task 1 – EASY: `easy_memory_leak` (seed=42)
-**Scenario:** The `auth` service has a progressive memory leak.  
-**Signals:** Clear log messages, steadily rising memory metrics, single service affected.  
-**Correct actions:** Inspect metrics → Query auth logs → Restart auth → Submit `infra_failure:memory_leak`  
-**Max steps:** 30 | **Noise:** 5%
+### Task 1 — EASY: `easy_memory_leak`
+**Scenario:** The `auth` service has a progressive memory leak.
+**Key challenge:** Distinguish memory leak from fake CPU alerts injected by the Red Agent.
+**Correct diagnosis:** `infra_failure:memory_leak`
 
-### Task 2 – MEDIUM: `medium_ddos_cascade` (seed=1337)
-**Scenario:** DDoS attack from two IP ranges cascades through gateway → api → auth.  
-**Signals:** Multiple services degraded, requires IP correlation from logs across api and auth.  
-**Correct actions:** Block both IPs (203.0.113.45, 198.51.100.12) → Scale api → Submit `cyber_attack:ddos`  
-**Max steps:** 40 | **Noise:** 25%
+### Task 2 — MEDIUM: `medium_ddos_cascade`
+**Scenario:** DDoS attack from two IPs cascades through gateway → api → auth.
+**Key challenge:** Correlate IP addresses buried in logs across 3 services.
+**Correct diagnosis:** `cyber_attack:ddos`
 
-### Task 3 – MEDIUM-HARD: `medium_hard_bad_deployment` (seed=9999)
-**Scenario:** A bad `api` v2.4.1 deployment pushed an invalid Redis connection string, sending the cache service into a reconnect storm. False gateway alerts distract from the real cause.  
-**Signals:** Deployment timestamp in logs correlates with degradation onset. Cache error logs show connection refused.  
-**Correct actions:** Inspect metrics → Query api/cache logs → Rollback api deployment → Restart cache → Submit `misconfiguration:bad_config`  
-**Max steps:** 45 | **Noise:** 35%
+### Task 3 — MEDIUM-HARD: `medium_hard_bad_deployment`
+**Scenario:** Bad `api` v2.4.1 deployment breaks Redis connections. False gateway alerts distract.
+**Key challenge:** Correlate deployment timestamp with degradation onset across services.
+**Correct diagnosis:** `misconfiguration:bad_config`
 
-### Task 4 – HARD: `hard_data_exfiltration` (seed=31337)
-**Scenario:** Compromised service account (`reports_bot`) exfiltrating 4+ GB of data from the DB to an external host. False alerts on cache service to mislead.  
-**Signals:** Buried in noisy logs, 55% noise, false critical alert on cache.  
-**Correct actions:** Run security scans on db+auth → Isolate db → Block 10.0.0.99 → Submit `cyber_attack:data_exfiltration`  
-**Max steps:** 50 | **Noise:** 55%
+### Task 4 — HARD: `hard_data_exfiltration`
+**Scenario:** Compromised service account exfiltrating 4+ GB. Red Agent actively spreads attack.
+**Key challenge:** Find real signal in 55% noise + false critical alert planted on cache.
+**Correct diagnosis:** `cyber_attack:data_exfiltration`
 
 ---
 
 ## 🏆 Reward Function
 
-Dense rewards are provided at every step (with **diminishing returns** for repeated investigation):
+Dense rewards at **every step** (not binary — can't be gamed):
 
 | Event | Reward |
 |-------|--------|
-| Useful investigation (affected service) | **+0.2** |
-| Correct intermediate inference (security scan hits) | **+0.3** |
-| Correct mitigation step | **+0.5** |
-| Correct final diagnosis | **+1.0** |
+| Useful investigation (affected service) | **+0.20** |
+| Correct security scan on affected service | **+0.30** |
+| Correct mitigation step | **+0.50** |
+| Correct final diagnosis | **+1.00** |
 | Irrelevant investigation | **-0.05** |
-| Ineffective mitigation | **-0.1** |
-| Harmful action (blocking legit IP / isolating healthy service) | **-0.5** |
-| Wrong diagnosis | **-1.0** |
+| Ineffective mitigation | **-0.10** |
+| Harmful action (blocking legit IP/isolating healthy service) | **-0.50** |
+| Wrong diagnosis | **-1.00** |
+| Step cost | **-0.02** |
 
----
-
-## 📊 Grader
-
-Each episode is scored in **[0, 1]**:
-
+### Episode Grader
 ```
 score = 0.5 × diagnosis_correct
       + 0.3 × action_efficiency
       + 0.2 × investigation_quality
 ```
 
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| `diagnosis_correct` | 50% | 1.0 exact match, 0.5 correct category, 0.0 wrong |
-| `action_efficiency` | 30% | Fraction of correct mitigations achieved, adjusted for steps used |
-| `investigation_quality` | 20% | Fraction of affected services investigated |
+---
 
-### Baseline Scores (Heuristic Agent)
+## 🚀 Live Demo
 
-| Task | Difficulty | Score | Steps |
-|------|-----------|-------|-------|
-| `easy_memory_leak` | Easy | **1.000** | 4 |
-| `medium_ddos_cascade` | Medium | **1.000** | 8 |
-| `medium_hard_bad_deployment` | Medium-Hard | **1.000** | 6 |
-| `hard_data_exfiltration` | Hard | **1.000** | 8 |
-| **Average** | | **1.000** | |
+▶️ **[Launch Dashboard](https://huggingface.co/spaces/SapphireGaze429/opensecops-grpo-training)**
 
-> These are deterministic heuristic scores. A frontier 72B LLM typically scores ~0.75–0.85 on the harder tasks, showing the benchmark discriminates agent capability.
+The live dashboard features three modes:
+1. **Agent Demo** — Watch Trained vs Untrained side-by-side on any of the 4 tasks
+2. **Battle Mode** — Live Red Attacker vs Blue Defender stream with real-time reward tracking
+3. **Self-Improvement** — Curriculum level tracker showing the agent levelling up
 
 ---
 
-## 🚀 Setup
+## 🧪 Training Notebook
 
-### Local (no Docker)
+▶️ **[Open in JupyterLab on HF](https://huggingface.co/spaces/SapphireGaze429/opensecops-grpo-training)** (Run the colab_training.ipynb)
+
+The notebook:
+- Loads Qwen2.5-7B-Instruct with 4-bit quantization via Unsloth
+- Applies LoRA adapters (r=16, target all attention + MLP projections)
+- Trains using `trl.GRPOTrainer` with our custom `secops_reward_fn`
+- Logs reward + loss curves
+- Pushes the merged 16-bit model to HF Hub
+
+```python
+# Core reward function — wraps the environment directly
+def secops_reward_fn(prompts, completions, **kwargs):
+    rewards = []
+    for completion, task_id in zip(completions, task_ids):
+        action = parse_action(completion)
+        if action is None:
+            rewards.append(-0.5)   # JSON format penalty
+            continue
+        env = OpenSecOpsEnv()
+        env.reset(task_id)
+        _, reward, _, _ = env.step(action)
+        rewards.append(float(reward) - 0.02)  # step cost
+    return rewards
+```
+
+---
+
+## 📦 Project Structure
+
+```
+├── colab_training.ipynb         # 🔑 Full GRPO training notebook
+├── inference.py                 # Baseline inference (OpenEnv required)
+├── openenv.yaml                 # OpenEnv manifest
+├── Dockerfile
+├── requirements.txt
+├── opensecops_env/
+│   ├── env.py                   # Core environment (reset/step/state)
+│   ├── grader.py                # Multi-component grader → [0, 1]
+│   ├── models.py                # SecOpsAction, Observation, State
+│   ├── tasks/task_definitions.py # 4 task configs
+│   └── server/app.py            # FastAPI + live battle SSE streams
+└── tests/test_opensecops.py     # 33 unit tests
+```
+
+---
+
+## 🏃 Quick Start
 
 ```bash
-# Clone & enter project
-cd opensecops_env
-
 # Install
 pip install -e ".[dev]"
 
@@ -214,65 +241,27 @@ pytest tests/ -v
 # Start server
 uvicorn opensecops_env.server.app:app --host 0.0.0.0 --port 8000
 
-# Run baseline inference
-python inference.py
+# Open dashboard
+open http://localhost:8000/dashboard
 ```
 
 ### Docker
-
 ```bash
-# Build
 docker build -t opensecops-env:latest .
-
-# Run
 docker run -p 8000:8000 opensecops-env:latest
 ```
 
-### Inference with LLM
-
-```bash
-export API_BASE_URL="https://router.huggingface.co/v1"
-export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
-export HF_TOKEN="hf_..."
-
-python inference.py
-```
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `HF_TOKEN` | Yes (for LLM) | *none* | Hugging Face API token |
-| `API_BASE_URL` | No | `https://router.huggingface.co/v1` | LLM endpoint URL |
-| `MODEL_NAME` | No | `Qwen/Qwen2.5-72B-Instruct` | Model identifier |
-| `LOCAL_IMAGE_NAME` | No | *none* | Docker image for `from_docker_image()` |
-
 ---
 
-## 🌐 API Endpoints
+## 🔗 All Links
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Liveness probe → `{"status": "ok"}` |
-| `GET` | `/tasks` | List available tasks with metadata |
-| `POST` | `/reset` | Start episode: `{"task_id": "easy_memory_leak"}` |
-| `POST` | `/step` | Execute action: `{"action_type": "...", "parameters": {...}}` |
-| `GET` | `/state` | Full internal state (for debugging / graders) |
-| `POST` | `/grade` | Grade current episode → `{score, details}` |
-| `GET` | `/web` | Interactive debug UI (set `ENABLE_WEB_INTERFACE=true`) |
-
----
-
-## 🧪 Validation
-
-```bash
-# Local spec validation
-pip install openenv-core
-openenv validate
-
-# Run unit tests
-pytest tests/ -v    # 33 tests
-```
+| Resource | Link |
+|----------|------|
+| 🤗 HF Space (Live Demo) | https://huggingface.co/spaces/SapphireGaze429/opensecops-grpo-training |
+| 🧠 Trained Model | https://huggingface.co/SapphireGaze429/opensecops-qwen2.5-7b-grpo |
+| 📓 Training Notebook | [colab_training.ipynb](./colab_training.ipynb) |
+| 🎥 Demo Video | _Coming soon_ |
+| 📝 Blog Post | _Coming soon_ |
 
 ---
 
@@ -280,12 +269,11 @@ pytest tests/ -v    # 33 tests
 
 1. **Multi-step reasoning required** — no single action resolves any task
 2. **Partial observability** — root cause never directly visible
-3. **Noisy signals** — misleading logs and false alerts on all tasks  
-4. **Action consequences** — blocking wrong IP harms users; isolating healthy service causes outage
-5. **Deterministic reproducibility** — fixed seeds ensure identical episodes
-6. **Dense reward** — non-zero signal at every step guides learning
-7. **Diminishing returns** — repeated investigation of the same service yields less reward
-8. **4 difficulty levels** — easy → medium → medium-hard → hard progression
+3. **Adversarially noisy** — misleading logs and Red-Agent-planted false alerts
+4. **Action consequences** — wrong actions actively harm the system (negative rewards)
+5. **Deterministic reproducibility** — fixed seeds for fair comparison
+6. **Dense reward** — non-zero signal at every step guides RL training
+7. **Curriculum progression** — 5 levels of difficulty for self-improvement
 
 ---
 

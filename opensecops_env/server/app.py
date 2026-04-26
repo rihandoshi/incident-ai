@@ -38,6 +38,7 @@ import copy
 import json
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -50,6 +51,129 @@ from opensecops_env.env import OpenSecOpsEnv
 from opensecops_env.grader import grade
 from opensecops_env.models import SecOpsAction
 from opensecops_env.tasks.task_definitions import TASKS
+
+# ---------------------------------------------------------------------------
+# 🤖 Live AI Inference Engine
+# ---------------------------------------------------------------------------
+# Set these environment variables to connect to your trained Hugging Face
+# Inference Endpoints. When not set, falls back to heuristic playbooks.
+#
+# TRAINED_MODEL_ENDPOINT   — your fine-tuned Qwen2.5-7B-GRPO endpoint
+# UNTRAINED_MODEL_ENDPOINT — base Qwen2.5-7B for contrast (optional)
+# HF_API_TOKEN             — your Hugging Face API token
+# ---------------------------------------------------------------------------
+
+_TRAINED_ENDPOINT: Optional[str] = os.environ.get("TRAINED_MODEL_ENDPOINT", "").strip() or None
+_UNTRAINED_ENDPOINT: Optional[str] = os.environ.get("UNTRAINED_MODEL_ENDPOINT", "").strip() or None
+_HF_API_TOKEN: str = os.environ.get("HF_API_TOKEN", os.environ.get("HF_TOKEN", ""))
+
+_AI_SYSTEM_PROMPT = """You are an expert on-call security engineer responding to a production incident.
+At each step you receive: alerts, metrics, logs, topology, last_action_result.
+Your goal: investigate the root cause and apply targeted mitigations.
+RESPOND ONLY with a valid JSON object:
+{"action_type": "<type>", "parameters": {<params>}}
+
+Actions: query_logs, inspect_metrics, restart_service, scale_service,
+         block_ip, rollback_deployment, run_security_scan,
+         isolate_service, submit_diagnosis
+
+Diagnosis labels:
+  infra_failure:memory_leak | infra_failure:service_crash
+  misconfiguration:bad_config
+  cyber_attack:ddos | cyber_attack:data_exfiltration | cyber_attack:privilege_escalation"""
+
+
+def _obs_to_text(obs: dict, step: int) -> str:
+    """Format an observation dict into the prompt text the model was trained on."""
+    parts = [f"=== Step {step} ==="]
+    parts.append(f"Last result: {obs.get('last_action_result', '')}")
+    if obs.get("alerts"):
+        parts.append("\nALERTS:")
+        for a in obs["alerts"]:
+            parts.append(f"  [{a.get('severity','').upper()}] {a.get('service')} - {a.get('message','')}")
+    parts.append("\nMETRICS:")
+    for svc, m in obs.get("metrics", {}).items():
+        if isinstance(m, dict):
+            parts.append(
+                f"  {svc}: cpu={m.get('cpu',0):.1f}% mem={m.get('memory',0):.1f}% "
+                f"lat={m.get('latency',0):.0f}ms err={m.get('error_rate',0):.2f}%"
+            )
+    parts.append("\nLOGS:")
+    for line in obs.get("logs", [])[:5]:
+        parts.append(f"  {line}")
+    parts.append("\nTOPOLOGY:")
+    for svc, deps in obs.get("topology", {}).items():
+        parts.append(f"  {svc} -> {deps}")
+    parts.append("\nRespond with JSON action:")
+    return "\n".join(parts)
+
+
+def _parse_ai_action(text: str) -> Optional[SecOpsAction]:
+    """Parse JSON action from LLM response text."""
+    if isinstance(text, list):
+        text = text[-1].get("content", "") if text else ""
+    if not isinstance(text, str):
+        text = str(text)
+    # Strip markdown code fences
+    text = re.sub(r"```[a-z]*\n?", "", text.strip()).strip()
+    # Extract first JSON object if wrapped in other text
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        text = m.group(0)
+    try:
+        d = json.loads(text)
+        return SecOpsAction(
+            action_type=d.get("action_type", "inspect_metrics"),
+            parameters=d.get("parameters", {}),
+        )
+    except Exception:
+        return None
+
+
+async def _query_ai_model(
+    endpoint_url: str,
+    obs: dict,
+    step: int,
+    timeout: float = 30.0,
+) -> Optional[SecOpsAction]:
+    """
+    Call a Hugging Face Inference Endpoint with the current observation.
+    Returns a parsed SecOpsAction, or None if the call fails.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None
+
+    prompt_text = _obs_to_text(obs, step)
+    payload = {
+        "inputs": prompt_text,
+        "parameters": {
+            "max_new_tokens": 128,
+            "temperature": 0.1,
+            "do_sample": True,
+            "return_full_text": False,
+        },
+    }
+    headers = {"Content-Type": "application/json"}
+    if _HF_API_TOKEN:
+        headers["Authorization"] = f"Bearer {_HF_API_TOKEN}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(endpoint_url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            # HF text-generation returns [{"generated_text": "..."}]
+            if isinstance(data, list) and data:
+                generated = data[0].get("generated_text", "")
+            elif isinstance(data, dict):
+                generated = data.get("generated_text", str(data))
+            else:
+                generated = str(data)
+            return _parse_ai_action(generated)
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Session registry  (session_id → OpenSecOpsEnv instance)
@@ -754,69 +878,115 @@ async def demo_stream(
 ):
     """
     Server-Sent Events stream of a full single-agent episode.
-    Powers the live dashboard. mode=trained uses expert agent,
-    mode=untrained uses the bad agent to show contrast.
+    Powers the live dashboard.
+
+    mode=trained  → calls TRAINED_MODEL_ENDPOINT (live AI) or heuristic fallback
+    mode=untrained → calls UNTRAINED_MODEL_ENDPOINT (base model) or bad-agent fallback
+
+    Fallback logic: if no endpoint is configured, uses deterministic playbooks
+    so the dashboard always works — even before the endpoint is live.
     """
     async def event_gen():
         try:
-            playbook = (
-                _HEURISTIC_PLAYBOOKS if mode == "trained"
-                else _BAD_AGENT_PLAYBOOKS
-            ).get(task_id, _HEURISTIC_PLAYBOOKS.get(task_id, []))
+            # Determine which endpoint to use
+            if mode == "trained":
+                endpoint = _TRAINED_ENDPOINT
+                fallback_playbook = _HEURISTIC_PLAYBOOKS.get(task_id, [])
+                agent_label = "🤖 Trained AI (Qwen2.5-7B-GRPO)"
+            else:
+                endpoint = _UNTRAINED_ENDPOINT
+                fallback_playbook = _BAD_AGENT_PLAYBOOKS.get(task_id, [])
+                agent_label = "⚠️ Untrained Base Model"
+
+            live_ai = endpoint is not None
 
             env = OpenSecOpsEnv()
             obs = env.reset(task_id)
+            obs_dict = {
+                "alerts": obs.alerts,
+                "metrics": obs.metrics,
+                "logs": obs.logs,
+                "topology": obs.topology,
+                "last_action_result": obs.last_action_result,
+                "time_step": obs.time_step,
+            }
 
             # Send initial state
             yield _sse({
                 "type": "reset",
                 "task_id": task_id,
                 "mode": mode,
-                "observation": {
+                "agent_label": agent_label,
+                "live_ai": live_ai,
+                "observation": obs_dict,
+            })
+
+            cumulative = 0.0
+            rewards_history: list[float] = []
+            step = 0
+            max_steps = TASKS[task_id]["max_steps"]
+            done = False
+
+            while not done and step < max_steps:
+                await asyncio.sleep(max(0.5, speed))
+                step += 1
+
+                # --- Decide action ---
+                action: Optional[SecOpsAction] = None
+                ai_raw: str = ""
+
+                if live_ai:
+                    action = await _query_ai_model(endpoint, obs_dict, step)
+                    if action is None:
+                        # AI call failed — fall back gracefully
+                        ai_raw = "[AI timeout — using fallback]"
+                        pb_idx = step - 1
+                        if pb_idx < len(fallback_playbook):
+                            d = fallback_playbook[pb_idx]
+                            action = SecOpsAction(
+                                action_type=d["action_type"],
+                                parameters=d.get("parameters", {}),
+                            )
+                        else:
+                            action = SecOpsAction(action_type="inspect_metrics", parameters={})
+                    else:
+                        ai_raw = f"{{\"action_type\": \"{action.action_type}\", \"parameters\": {json.dumps(action.parameters)}}}"
+                else:
+                    pb_idx = step - 1
+                    if pb_idx < len(fallback_playbook):
+                        d = fallback_playbook[pb_idx]
+                        action = SecOpsAction(
+                            action_type=d["action_type"],
+                            parameters=d.get("parameters", {}),
+                        )
+                    else:
+                        break
+
+                obs, reward, done, info = env.step(action)
+                obs_dict = {
                     "alerts": obs.alerts,
                     "metrics": obs.metrics,
                     "logs": obs.logs,
                     "topology": obs.topology,
                     "last_action_result": obs.last_action_result,
                     "time_step": obs.time_step,
-                },
-            })
-
-            cumulative = 0.0
-            rewards_history: list[float] = []
-
-            for i, action_dict in enumerate(playbook):
-                await asyncio.sleep(max(0.5, speed))
-
-                action = SecOpsAction(
-                    action_type=action_dict["action_type"],
-                    parameters=action_dict.get("parameters", {}),
-                )
-                obs, reward, done, info = env.step(action)
+                }
                 cumulative += reward
                 rewards_history.append(round(reward, 4))
 
                 yield _sse({
                     "type": "step",
-                    "step": i + 1,
+                    "step": step,
                     "action_type": action.action_type,
                     "parameters": action.parameters,
                     "reward": round(reward, 4),
                     "cumulative_reward": round(cumulative, 4),
                     "rewards_history": rewards_history,
                     "done": done,
-                    "observation": {
-                        "alerts": obs.alerts,
-                        "metrics": obs.metrics,
-                        "logs": obs.logs,
-                        "topology": obs.topology,
-                        "last_action_result": obs.last_action_result,
-                        "time_step": obs.time_step,
-                    },
+                    "live_ai": live_ai,
+                    "ai_raw": ai_raw,
+                    "observation": obs_dict,
                 })
-
-                if done:
-                    break
 
             # Final grade
             await asyncio.sleep(0.5)
@@ -830,6 +1000,8 @@ async def demo_stream(
                 "details": result.details,
                 "rewards_history": rewards_history,
                 "cumulative_reward": round(cumulative, 4),
+                "live_ai": live_ai,
+                "agent_label": agent_label,
             })
 
         except Exception as e:
@@ -853,40 +1025,46 @@ async def battle_stream(
     """
     🔴 vs 🔵  Attacker vs Defender live battle SSE stream.
     Interleaves Red (Attacker) and Blue (Defender) turns.
-    Powers the multi-agent panel in the dashboard.
+
+    Blue Agent uses TRAINED_MODEL_ENDPOINT when set (live AI),
+    otherwise falls back to the heuristic expert playbook.
     """
     async def event_gen():
         try:
+            live_ai = _TRAINED_ENDPOINT is not None
+
             ma_env = MultiAgentSecOpsEnv()
             state_dict = ma_env.reset(task_id)
-            obs = state_dict["observation"]
+            obs_dict = state_dict["observation"]
 
             yield _sse({
                 "type": "battle_reset",
                 "task_id": task_id,
-                "observation": obs,
+                "observation": obs_dict,
                 "multi_agent": state_dict.get("multi_agent", {}),
+                "live_ai": live_ai,
+                "blue_label": "🤖 Trained AI" if live_ai else "🧠 Expert Heuristic",
             })
 
             blue_playbook = copy.deepcopy(
                 _HEURISTIC_PLAYBOOKS.get(task_id, _HEURISTIC_PLAYBOOKS["hard_data_exfiltration"])
             )
-            red_actions = _RED_PLAYBOOK_BY_TASK.get(task_id, ["inject_noise", "amplify_attack", "corrupt_metric"])
+            red_actions = _RED_PLAYBOOK_BY_TASK.get(
+                task_id, ["inject_noise", "amplify_attack", "corrupt_metric"]
+            )
 
             blue_rewards: list[float] = []
             red_rewards: list[float] = []
             blue_cum = 0.0
             red_cum = 0.0
             done = False
-            round_num = 0
+            max_steps = TASKS[task_id]["max_steps"]
 
-            max_rounds = max(len(blue_playbook), len(red_actions)) + 2
-
-            for round_num in range(max_rounds):
+            for round_num in range(max_steps):
                 if done:
                     break
 
-                # — Red turn (Attacker escalates) —
+                # ── Red turn (Attacker escalates) ────────────────────────────
                 red_action_type = (
                     red_actions[round_num % len(red_actions)]
                     if red_actions else "inject_noise"
@@ -896,6 +1074,7 @@ async def battle_stream(
                 red_state, red_r, done, red_info = ma_env.red_step(red_action_type)
                 red_cum += red_r
                 red_rewards.append(round(red_r, 4))
+                obs_dict = red_state.get("observation", obs_dict)
 
                 yield _sse({
                     "type": "red_step",
@@ -905,7 +1084,7 @@ async def battle_stream(
                     "red_cumulative": round(red_cum, 4),
                     "blue_cumulative": round(blue_cum, 4),
                     "message": red_info.get("message", ""),
-                    "observation": red_state.get("observation", {}),
+                    "observation": obs_dict,
                     "multi_agent": red_state.get("multi_agent", {}),
                     "red_rewards": red_rewards,
                     "blue_rewards": blue_rewards,
@@ -914,35 +1093,48 @@ async def battle_stream(
                 if done:
                     break
 
-                # — Blue turn (Defender responds) —
-                if round_num < len(blue_playbook):
-                    blue_action_dict = blue_playbook[round_num]
-                else:
-                    break
-
+                # ── Blue turn (Defender responds) ────────────────────────────
                 await asyncio.sleep(max(0.5, speed * 0.6))
 
-                action = SecOpsAction(
-                    action_type=blue_action_dict["action_type"],
-                    parameters=blue_action_dict.get("parameters", {}),
-                )
+                action: Optional[SecOpsAction] = None
+                ai_raw: str = ""
+
+                if live_ai:
+                    action = await _query_ai_model(_TRAINED_ENDPOINT, obs_dict, round_num + 1)
+                    if action:
+                        ai_raw = f'{{"action_type": "{action.action_type}", "parameters": {json.dumps(action.parameters)}}}'
+
+                if action is None:
+                    # Fallback to heuristic for this round
+                    if round_num < len(blue_playbook):
+                        d = blue_playbook[round_num]
+                        action = SecOpsAction(
+                            action_type=d["action_type"],
+                            parameters=d.get("parameters", {}),
+                        )
+                    else:
+                        break
+
                 blue_state, blue_r, done, blue_info = ma_env.blue_step(action)
                 blue_cum += blue_r
                 blue_rewards.append(round(blue_r, 4))
+                obs_dict = blue_state.get("observation", obs_dict)
 
                 yield _sse({
                     "type": "blue_step",
                     "round": round_num + 1,
-                    "action": blue_action_dict["action_type"],
-                    "parameters": blue_action_dict.get("parameters", {}),
+                    "action": action.action_type,
+                    "parameters": action.parameters,
                     "reward": round(blue_r, 4),
                     "blue_cumulative": round(blue_cum, 4),
                     "red_cumulative": round(red_cum, 4),
-                    "result": blue_state.get("observation", {}).get("last_action_result", ""),
-                    "observation": blue_state.get("observation", {}),
+                    "result": obs_dict.get("last_action_result", ""),
+                    "observation": obs_dict,
                     "multi_agent": blue_state.get("multi_agent", {}),
                     "red_rewards": red_rewards,
                     "blue_rewards": blue_rewards,
+                    "live_ai": live_ai,
+                    "ai_raw": ai_raw,
                 })
 
                 if done:
@@ -964,6 +1156,7 @@ async def battle_stream(
                 "blue_rewards": blue_rewards,
                 "red_rewards": red_rewards,
                 "details": result.details,
+                "live_ai": live_ai,
             })
 
         except Exception as e:
