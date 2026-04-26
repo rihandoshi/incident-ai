@@ -71,6 +71,13 @@ _TRAINED_ENDPOINT: Optional[str] = (
 _UNTRAINED_ENDPOINT: Optional[str] = os.environ.get("UNTRAINED_MODEL_ENDPOINT", "").strip() or None
 _HF_API_TOKEN: str = os.environ.get("HF_API_TOKEN", os.environ.get("HF_TOKEN", ""))
 
+if not _HF_API_TOKEN:
+    print(
+        "\n⚠️  WARNING: HF_API_TOKEN / HF_TOKEN not set. "
+        "The live AI endpoint will get 401 Unauthorized and fall back to heuristic playbooks.\n"
+        "   Fix: export HF_TOKEN=hf_xxxx before starting uvicorn.\n"
+    )
+
 _AI_SYSTEM_PROMPT = """You are an expert on-call security engineer responding to a production incident.
 At each step you receive: alerts, metrics, logs, topology, last_action_result.
 Your goal: investigate the root cause and apply targeted mitigations.
@@ -176,8 +183,25 @@ async def _query_ai_model(
             else:
                 generated = str(data)
             return _parse_ai_action(generated)
-    except Exception:
+    except Exception as e:
+        print(f"[AI] endpoint call failed: {type(e).__name__}: {e}")
         return None
+
+
+def _randomise_env_seed(env: Any, episode_seed: Optional[int] = None) -> None:
+    """
+    Override the env's internal RNG with a fresh random seed after reset.
+    This makes each episode unique — different metric drift, different log ordering,
+    different alert shuffling — so the dashboard never shows the same episode twice.
+    """
+    seed = episode_seed if episode_seed is not None else random.randint(0, 2**31)
+    env._rng = random.Random(seed)
+    # Also add small random noise to initial metrics so starting values vary
+    for svc, metrics in env._metrics.items():
+        jitter = random.Random(seed + hash(svc))
+        metrics.cpu     = max(0.0, min(100.0, metrics.cpu     + jitter.uniform(-8, 8)))
+        metrics.memory  = max(0.0, min(100.0, metrics.memory  + jitter.uniform(-5, 5)))
+        metrics.latency = max(0.0, min(5000.0, metrics.latency + jitter.uniform(-15, 30)))
 
 # ---------------------------------------------------------------------------
 # Session registry  (session_id → OpenSecOpsEnv instance)
@@ -237,12 +261,16 @@ class MultiAgentSecOpsEnv:
     def __init__(self) -> None:
         self._env = OpenSecOpsEnv()
         self._red_state = RedAgentState()
-        self._rng = random.Random(42)
+        self._rng = random.Random()  # Unseeded — random each episode
         self._cumulative_blue_reward = 0.0
         self._cumulative_red_reward = 0.0
 
     def reset(self, task_id: str) -> dict[str, Any]:
         obs = self._env.reset(task_id)
+        # Randomise the env seed so each episode differs
+        episode_seed = random.randint(0, 2**31)
+        _randomise_env_seed(self._env, episode_seed)
+        self._rng = random.Random(episode_seed)  # Red agent also differently seeded
         self._red_state = RedAgentState(task_id=task_id)
         self._cumulative_blue_reward = 0.0
         self._cumulative_red_reward = 0.0
@@ -869,6 +897,40 @@ _RED_PLAYBOOK_BY_TASK: dict[str, list[str]] = {
     "hard_data_exfiltration":     ["amplify_attack", "accelerate_spread", "create_false_alert", "amplify_attack", "inject_noise"],
 }
 
+# ---------------------------------------------------------------------------
+# Debug: test the live AI endpoint directly
+# ---------------------------------------------------------------------------
+@app.get("/debug/ai")
+async def debug_ai():
+    """Test the live AI endpoint with a sample observation. Shows exact response."""
+    if not _TRAINED_ENDPOINT:
+        return {"error": "No endpoint configured", "token_set": bool(_HF_API_TOKEN)}
+    test_obs = {
+        "alerts": [{"service": "db", "severity": "critical", "message": "Unusual outbound traffic"}],
+        "metrics": {"db": {"cpu": 82.0, "memory": 71.0, "latency": 95.0, "error_rate": 1.2}},
+        "logs": ["[db] CRIT Unusual 8GB export to external host 10.0.0.99"],
+        "topology": {"db": ["auth", "api"]},
+        "last_action_result": "",
+        "time_step": 1,
+    }
+    import httpx
+    prompt = _obs_to_text(test_obs, 1)
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 128, "temperature": 0.1, "return_full_text": False}}
+    headers = {"Content-Type": "application/json"}
+    if _HF_API_TOKEN:
+        headers["Authorization"] = f"Bearer {_HF_API_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(_TRAINED_ENDPOINT, json=payload, headers=headers)
+            return {
+                "status_code": resp.status_code,
+                "token_set": bool(_HF_API_TOKEN),
+                "endpoint": _TRAINED_ENDPOINT[:50],
+                "response": resp.json() if resp.status_code == 200 else resp.text[:500],
+            }
+    except Exception as e:
+        return {"error": str(e), "token_set": bool(_HF_API_TOKEN), "endpoint": _TRAINED_ENDPOINT[:50]}
+
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
@@ -906,6 +968,9 @@ async def demo_stream(
 
             env = OpenSecOpsEnv()
             obs = env.reset(task_id)
+            # Randomise seed so every run differs (different metric drift, alert order, etc.)
+            episode_seed = random.randint(0, 2**31)
+            _randomise_env_seed(env, episode_seed)
             obs_dict = {
                 "alerts": obs.alerts,
                 "metrics": obs.metrics,
